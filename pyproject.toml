@@ -1,0 +1,56 @@
+[project]
+name = "fastmcp-pr-review"
+version = "0.1.0"
+description = "FastMCP server for GitHub PR review with structured sampling"
+readme = "README.md"
+authors = [
+    { name = "strawgate", email = "williamseaston@gmail.com" },
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "githubkit[auth-app]>=0.12.0",
+    "google-genai>=1.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+fastmcp-pr-review = "fastmcp_pr_review.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.14",
+    "ruff>=0.11",
+    "ty>=0.0.1a7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking
+    "RUF",   # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fastmcp_pr_review"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
