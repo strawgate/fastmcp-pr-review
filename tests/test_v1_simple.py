@@ -1,7 +1,5 @@
 """Tests for v1 simple single-shot review."""
 
-from __future__ import annotations
-
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -64,7 +62,6 @@ class TestSimpleReview:
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_diff = AsyncMock(return_value="diff content")
 
         result = await simple_review(gh, ctx, "owner/repo", 1)
 
@@ -75,12 +72,24 @@ class TestSimpleReview:
         assert "tools" not in call_kwargs
 
     @pytest.mark.asyncio
+    async def test_does_not_call_get_diff(self) -> None:
+        """v1 uses timeline file patches, never calls get_diff separately."""
+        ctx = MagicMock()
+        ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=_make_timeline())
+        gh.get_diff = AsyncMock()
+
+        await simple_review(gh, ctx, "owner/repo", 1)
+
+        gh.get_diff.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_includes_focus_areas(self) -> None:
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_diff = AsyncMock(return_value="diff")
 
         await simple_review(gh, ctx, "owner/repo", 1, focus_areas="security")
 
@@ -93,9 +102,32 @@ class TestSimpleReview:
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_diff = AsyncMock(return_value="unique_diff_marker")
 
         await simple_review(gh, ctx, "owner/repo", 1)
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "src/main.py" in messages
+
+    @pytest.mark.asyncio
+    async def test_handles_no_patches(self) -> None:
+        """When files have no patches, prompt shows a fallback message."""
+        timeline = _make_timeline()
+        timeline.files = [
+            PRFile(
+                filename="binary.png",
+                status="modified",
+                additions=0,
+                deletions=0,
+                changes=0,
+                patch=None,
+            )
+        ]
+        ctx = MagicMock()
+        ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=timeline)
+
+        await simple_review(gh, ctx, "owner/repo", 1)
+
+        messages = ctx.sample.call_args.kwargs["messages"]
+        assert "(no patches available)" in messages

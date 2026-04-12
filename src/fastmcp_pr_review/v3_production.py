@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 from collections import Counter
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -38,6 +39,8 @@ from fastmcp_pr_review.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fastmcp import Context
 
     from fastmcp_pr_review.github_client import GitHubPRClient
@@ -70,6 +73,30 @@ INTENSITY_GUIDELINES = {
         "Still require evidence — no speculative concerns."
     ),
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Review context — bundles shared state passed through the pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class _ReviewCtx:
+    """Shared context threaded through review and verify passes.
+
+    Bundles the parameters that every pass needs so individual functions
+    take 2-3 arguments instead of 10+ positional params.
+    """
+
+    gh: GitHubPRClient
+    ctx: Context
+    repo: str
+    timeline: PRTimeline
+    existing_threads: dict[str, list[PRReviewComment]] = field(default_factory=dict)
+    prior_reviews: list[str] = field(default_factory=list)
+    focus_areas: str | None = None
+    intensity: str = "balanced"
+    concurrency: int = 3
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -141,25 +168,58 @@ class FileFindings(BaseModel):
 
 
 # -- Pass 4: Verify --
+# Instead of asking the LLM to produce a complex nested schema as structured
+# output, the verify pass uses TOOL CALLS to collect results. The LLM calls
+# confirm_finding() or dismiss_finding() as it explores, and the confirmed
+# findings accumulate in a list via closure. The result_type is trivial.
 
 
-class VerifiedFinding(BaseModel):
-    """A finding after agentic verification."""
+class VerifyComplete(BaseModel):
+    """Trivial result_type for the verify pass — just signals completion.
 
-    original_title: str
-    status: str = Field(description="confirmed, disproved, or inconclusive")
-    evidence: str = Field(description="Concrete evidence: file paths, line numbers, code")
-    comment: ReviewComment | None = Field(
-        default=None,
-        description="Final comment — only when confirmed",
-    )
+    The real results come from confirm_finding/dismiss_finding tool calls
+    that accumulate ReviewComments in a closure during the agentic loop.
+    """
+
+    summary: str = Field(description="Brief summary of verification results")
 
 
-class ExploreResult(BaseModel):
-    """result_type for verification — structured output + multiple tools."""
+# ═══════════════════════════════════════════════════════════════════════════
+# Shared tool factory — used by both Pass 3 (Review) and Pass 4 (Verify)
+# ═══════════════════════════════════════════════════════════════════════════
 
-    filename: str
-    verified: list[VerifiedFinding] = Field(default_factory=list)
+
+def _make_tools(
+    gh: GitHubPRClient,
+    timeline: PRTimeline,
+    repo: str,
+) -> list[Callable[..., object]]:
+    """Build the three exploration tools used by review and verify passes.
+
+    Returns a consistent set of tool closures so both passes expose
+    identical capabilities with identical names.
+    """
+    pr = timeline.pr
+    all_files = timeline.files
+
+    async def get_file_contents(filepath: str) -> str:
+        """Read any file in the repo at the PR's head ref."""
+        return await gh.get_file_contents(repo, filepath, pr.head_sha)
+
+    def lookup_file_diff(filename: str) -> str:
+        """See another file's diff from this PR."""
+        for f in all_files:
+            if f.filename == filename:
+                return f.patch or "(no patch available)"
+        return f"File '{filename}' not in this PR"
+
+    def list_changed_files() -> str:
+        """List all files changed in this PR."""
+        return "\n".join(
+            f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in all_files
+        )
+
+    return [get_file_contents, lookup_file_diff, list_changed_files]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -204,6 +264,8 @@ Finding no issues is a valid and valuable outcome.
 - Do NOT re-flag issues that have existing review threads
 - Every finding MUST include a concrete failure scenario
 - Describe what verification would confirm or disprove each finding
+- Check for completeness: if the PR applies a fix across multiple files, verify it was applied everywhere
+- Use tools to check related files for consistency with the change
 </constraints>
 
 <severity_classification>
@@ -221,7 +283,8 @@ Do NOT flag:
 - Null/undefined guarded by types or prior assertion
 - Error handling delegated to caller or middleware
 - Performance concern where N is demonstrably small
-- Style not violating documented project guidelines
+- Style preferences or code organization choices that are clearly intentional
+- Any issue where you cannot describe a concrete failure scenario
 </false_positives>
 
 <verification_protocol>
@@ -241,19 +304,22 @@ to explore the repository and confirm or disprove each finding.
 
 <protocol>
 For each finding:
-1. Read its verification_needs.
-2. Use tools to gather evidence (read files, check callers, imports).
-3. Decide: confirmed, disproved, or inconclusive.
-4. Provide specific evidence (file paths, line numbers, code snippets).
-5. If confirmed → produce a ReviewComment with updated confidence.
-   If disproved/inconclusive → explain why, do NOT produce a comment.
+1. Read its verification_needs to understand what to check.
+2. Use exploration tools to gather evidence:
+   - get_file_contents(path) to read source files
+   - lookup_file_diff(path) to see other files' diffs
+   - list_changed_files() to see all changed files
+3. Based on evidence, call ONE of:
+   - confirm_finding(...) if the issue is real
+   - dismiss_finding(...) if the issue is not real or inconclusive
+4. Move on to the next finding.
 </protocol>
 
 <guidelines>
-- Be thorough but efficient.
-- Start with what verification_needs suggests.
-- Do NOT invent new findings — only verify what was found.
-- Raise confidence when evidence strongly supports the finding.
+- Be thorough but efficient. Start with what verification_needs suggests.
+- Do NOT invent new findings — only verify what was already found.
+- Every finding MUST be either confirmed or dismissed before you finish.
+- When confirming, provide an updated confidence score based on evidence.
 </guidelines>"""
 
 
@@ -275,7 +341,7 @@ async def production_review(
     concurrency: int = 3,
     min_confidence: int = 50,
 ) -> PRReviewResult:
-    """Production PR review: Filter → Review → Verify.
+    """Production PR review: Filter -> Review -> Verify.
 
     Pass 1: Gather full context (timeline, prior reviews, existing threads)
     Pass 2: Batch-filter files by interest level
@@ -321,32 +387,33 @@ async def production_review(
     # - Tools to explore related files
     # - A verification protocol the LLM must follow
 
-    file_findings = await _review_files(
-        gh,
-        ctx,
-        reviewables,
-        timeline,
-        comments_by_file,
-        prior_reviews,
-        focus_areas,
-        intensity,
-        concurrency,
-        repo,
+    rctx = _ReviewCtx(
+        gh=gh,
+        ctx=ctx,
+        repo=repo,
+        timeline=timeline,
+        existing_threads=comments_by_file,
+        prior_reviews=prior_reviews,
+        focus_areas=focus_areas,
+        intensity=intensity,
+        concurrency=concurrency,
     )
 
-    # ═══════════════════════════════════════════════════════════════════
-    # PASS 4: Verify — agentic ctx.sample() + MULTIPLE tools
-    # ═══════════════════════════════════════════════════════════════════
-    # For each file with findings, the LLM explores the repo to confirm
-    # or disprove them. It can read any file, check callers, look at
-    # imports. Only confirmed findings survive to the final output.
+    file_findings = await _review_files(rctx, reviewables=reviewables)
 
-    explore_results = await _verify_findings(gh, ctx, file_findings, timeline, repo, concurrency)
+    # ═══════════════════════════════════════════════════════════════════
+    # PASS 4: Verify — agentic ctx.sample() + tool-based collection
+    # ═══════════════════════════════════════════════════════════════════
+    # For each file with findings, the LLM explores the repo and calls
+    # confirm_finding() or dismiss_finding() tools. Only confirmed
+    # findings survive. No complex structured output needed.
 
-    # Aggregate — only confirmed, verified findings
+    confirmed_comments = await _verify_findings(rctx, all_findings=file_findings)
+
+    # Aggregate
     return _aggregate(
         file_findings,
-        explore_results,
+        confirmed_comments,
         total_files,
         files_prefiltered + files_filtered,
         min_confidence,
@@ -419,7 +486,7 @@ async def _filter_files(
             system_prompt=FILTER_SYSTEM_PROMPT,
             result_type=FilterBatchResult,
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=16384,
         )
         return r.result
 
@@ -448,55 +515,32 @@ async def _filter_files(
 
 
 async def _review_files(
-    gh: GitHubPRClient,
-    ctx: Context,
+    rctx: _ReviewCtx,
+    *,
     reviewables: list[tuple[DiffChunk, FilteredChunk]],
-    timeline: PRTimeline,
-    existing_threads: dict[str, list[PRReviewComment]],
-    prior_reviews: list[str],
-    focus_areas: str | None,
-    intensity: str,
-    concurrency: int,
-    repo: str,
 ) -> list[FileFindings]:
     """Review files with bounded concurrency."""
     if not reviewables:
         return []
 
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(rctx.concurrency)
 
     async def review(chunk: DiffChunk, fc: FilteredChunk) -> FileFindings:
         async with sem:
-            return await _review_one(
-                gh,
-                ctx,
-                chunk,
-                fc,
-                timeline,
-                existing_threads.get(chunk.filename, []),
-                prior_reviews,
-                focus_areas,
-                intensity,
-                repo,
-            )
+            return await _review_one(rctx, chunk=chunk, classification=fc)
 
     return list(await asyncio.gather(*(review(c, fc) for c, fc in reviewables)))
 
 
 async def _review_one(
-    gh: GitHubPRClient,
-    ctx: Context,
+    rctx: _ReviewCtx,
+    *,
     chunk: DiffChunk,
     classification: FilteredChunk,
-    timeline: PRTimeline,
-    existing_threads: list[PRReviewComment],
-    prior_reviews: list[str],
-    focus_areas: str | None,
-    intensity: str,
-    repo: str,
 ) -> FileFindings:
     """Review a single file with full context."""
-    pr = timeline.pr
+    pr = rctx.timeline.pr
+    existing_threads = rctx.existing_threads.get(chunk.filename, [])
 
     # Format existing threads so LLM knows not to re-flag
     threads_section = "(none)"
@@ -507,8 +551,8 @@ async def _review_one(
 
     # Format prior review bodies
     prior_section = "(none)"
-    if prior_reviews:
-        prior_section = "\n---\n".join(body[:300] for body in prior_reviews[:3])
+    if rctx.prior_reviews:
+        prior_section = "\n---\n".join(body[:300] for body in rctx.prior_reviews[:3])
 
     # Format focus hints from filter stage
     hints_section = ""
@@ -540,37 +584,19 @@ async def _review_one(
         f"</prior_reviews>\n\n"
         f"Review this file."
     )
-    if focus_areas:
-        prompt += f"\n\nFocus especially on: {focus_areas}"
+    if rctx.focus_areas:
+        prompt += f"\n\nFocus especially on: {rctx.focus_areas}"
 
-    # Tools for cross-file exploration
-    all_files = timeline.files
-
-    async def get_file_contents(filepath: str) -> str:
-        """Read any file in the repo at the PR's head ref."""
-        return await gh.get_file_contents(repo, filepath, pr.head_sha)
-
-    def lookup_file_diff(filename: str) -> str:
-        """See another file's diff from this PR."""
-        for f in all_files:
-            if f.filename == filename:
-                return f.patch or "(no patch available)"
-        return f"File '{filename}' not in this PR"
-
-    def list_pr_files() -> str:
-        """List all files changed in this PR."""
-        return "\n".join(
-            f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in all_files
-        )
+    tools = _make_tools(rctx.gh, rctx.timeline, rctx.repo)
 
     # ctx.sample() with tools + verification protocol in the system prompt
-    result = await ctx.sample(
+    result = await rctx.ctx.sample(
         messages=prompt,
-        system_prompt=_review_system_prompt(intensity),
+        system_prompt=_review_system_prompt(rctx.intensity),
         result_type=FileFindings,
-        tools=[get_file_contents, lookup_file_diff, list_pr_files],
+        tools=tools,
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=16384,
     )
     return result.result
 
@@ -581,44 +607,93 @@ async def _review_one(
 
 
 async def _verify_findings(
-    gh: GitHubPRClient,
-    ctx: Context,
+    rctx: _ReviewCtx,
+    *,
     all_findings: list[FileFindings],
-    timeline: PRTimeline,
-    repo: str,
-    concurrency: int,
-) -> list[ExploreResult]:
-    """Verify findings agentically. Only files with findings are explored."""
+) -> list[ReviewComment]:
+    """Verify findings agentically. Returns only confirmed comments.
+
+    Instead of asking the LLM to produce a complex nested schema,
+    the LLM calls confirm_finding() / dismiss_finding() tools as it
+    explores. Confirmed findings accumulate in a list via closure.
+    """
     with_findings = [f for f in all_findings if f.findings]
     if not with_findings:
         return []
 
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(rctx.concurrency)
 
-    async def verify(ff: FileFindings) -> ExploreResult:
+    async def verify(ff: FileFindings) -> list[ReviewComment]:
         async with sem:
-            return await _verify_one_file(gh, ctx, ff, timeline, repo)
+            return await _verify_one_file(rctx, findings=ff)
 
-    return list(await asyncio.gather(*(verify(ff) for ff in with_findings)))
+    results = await asyncio.gather(*(verify(ff) for ff in with_findings))
+    # Flatten list of lists into a single list of confirmed comments
+    return [c for batch in results for c in batch]
 
 
 async def _verify_one_file(
-    gh: GitHubPRClient,
-    ctx: Context,
+    rctx: _ReviewCtx,
+    *,
     findings: FileFindings,
-    timeline: PRTimeline,
-    repo: str,
-) -> ExploreResult:
+) -> list[ReviewComment]:
     """Verify one file's findings via agentic tool loop.
 
-    The LLM can call tools repeatedly — read files, check callers,
-    look at imports — until it has enough evidence to confirm or
-    disprove each finding.
+    The LLM calls confirm_finding() or dismiss_finding() for each
+    suspected issue. Exploration tools let it read files, check
+    callers, and look at imports. Confirmed findings are collected
+    via closure — no complex structured output needed.
     """
-    pr = timeline.pr
-    all_files = timeline.files
+    pr = rctx.timeline.pr
 
-    # Format findings for the prompt
+    # --- State that accumulates across the tool loop ---
+    confirmed: list[ReviewComment] = []
+    dismissed: list[str] = []
+
+    # --- Finding management tools ---
+
+    def confirm_finding(
+        title: str,
+        evidence: str,
+        path: str,
+        line: int | None = None,
+        severity: str = "medium",
+        category: str = "bug",
+        body: str = "",
+        why: str = "",
+        suggested_code: str | None = None,
+        confidence: int = 80,
+    ) -> str:
+        """Confirm a finding is real and add it to the review.
+
+        Call this when your investigation confirms the issue exists.
+        Provide the evidence you found and an updated confidence score.
+        """
+        confirmed.append(
+            ReviewComment(
+                path=path,
+                line=line,
+                severity=Severity(severity),
+                category=CommentCategory(category),
+                title=title,
+                body=body or f"Confirmed: {title}",
+                why=why or evidence,
+                suggested_code=suggested_code,
+                confidence=confidence,
+            )
+        )
+        return f"Confirmed '{title}' (confidence={confidence}). {len(confirmed)} finding(s) so far."
+
+    def dismiss_finding(title: str, reason: str) -> str:
+        """Dismiss a finding — it's not a real issue.
+
+        Call this when your investigation shows the issue doesn't exist,
+        is handled elsewhere, or is inconclusive.
+        """
+        dismissed.append(f"{title}: {reason}")
+        return f"Dismissed '{title}'. Reason: {reason}"
+
+    # --- Build prompt ---
     findings_text = []
     for i, f in enumerate(findings.findings):
         extra = f"\nSuggested fix: {f.suggested_code}" if f.suggested_code else ""
@@ -641,37 +716,27 @@ async def _verify_one_file(
         f"File: {findings.filename}\n"
         f"Summary: {findings.file_summary}\n"
         f"</context>\n\n"
-        f"Verify these {len(findings.findings)} findings:\n\n" + "\n\n".join(findings_text)
+        f"Verify these {len(findings.findings)} findings.\n"
+        f"For each one, explore the repo, then call confirm_finding() or dismiss_finding().\n\n"
+        + "\n\n".join(findings_text)
     )
 
-    # Three tools for repo exploration
-    async def get_file_contents(filepath: str) -> str:
-        """Read any file in the repo at the PR's head ref."""
-        return await gh.get_file_contents(repo, filepath, pr.head_sha)
+    # Combine exploration tools + finding management tools
+    exploration_tools = _make_tools(rctx.gh, rctx.timeline, rctx.repo)
 
-    def lookup_file_diff(filename: str) -> str:
-        """See another file's diff from this PR."""
-        for f in all_files:
-            if f.filename == filename:
-                return f.patch or "(no patch available)"
-        return f"File '{filename}' not in this PR"
-
-    def list_changed_files() -> str:
-        """List all files changed in this PR."""
-        return "\n".join(
-            f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in all_files
-        )
-
-    # Agentic sampling: LLM calls tools in a loop until done
-    result = await ctx.sample(
+    # --- Agentic sampling with tool-based result collection ---
+    # The LLM calls confirm_finding/dismiss_finding as it explores.
+    # result_type is just a trivial completion signal.
+    await rctx.ctx.sample(
         messages=prompt,
         system_prompt=EXPLORE_SYSTEM_PROMPT,
-        result_type=ExploreResult,
-        tools=[get_file_contents, lookup_file_diff, list_changed_files],
+        result_type=VerifyComplete,
+        tools=[confirm_finding, dismiss_finding, *exploration_tools],
         temperature=0.2,
-        max_tokens=8192,
+        max_tokens=16384,
     )
-    return result.result
+
+    return confirmed
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -681,21 +746,13 @@ async def _verify_one_file(
 
 def _aggregate(
     file_findings: list[FileFindings],
-    explore_results: list[ExploreResult],
+    confirmed_comments: list[ReviewComment],
     total_files: int,
     files_skipped: int,
     min_confidence: int,
 ) -> PRReviewResult:
     """Build the final result from verified findings only."""
-    comments: list[ReviewComment] = []
-    for er in explore_results:
-        for vf in er.verified:
-            if (
-                vf.status == "confirmed"
-                and vf.comment is not None
-                and vf.comment.confidence >= min_confidence
-            ):
-                comments.append(vf.comment)
+    comments = [c for c in confirmed_comments if c.confidence >= min_confidence]
 
     sev = Counter(c.severity.value for c in comments)
     cat = Counter(c.category.value for c in comments)

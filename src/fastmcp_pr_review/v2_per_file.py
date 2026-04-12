@@ -6,9 +6,9 @@ Demonstrates the natural next step beyond v1:
   - Structured output per file, aggregated into a final result
 
 New concepts beyond v1:
-  - tools=[...] parameter — the LLM can call Python functions mid-review
-  - Per-file iteration — each file gets focused attention
-  - Async tool — get_file_contents reads from the repo via GitHub API
+  - tools=[...] parameter -- the LLM can call Python functions mid-review
+  - Per-file iteration -- each file gets focused attention
+  - Async tool -- get_file_contents reads from the repo via GitHub API
 
 This is what you'd build after spending a couple days iterating on v1:
 "What if I gave the LLM tools to explore the codebase while reviewing?"
@@ -17,10 +17,11 @@ This is what you'd build after spending a couple days iterating on v1:
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING
 
+from fastmcp import Context  # noqa: TC002
 from pydantic import BaseModel, Field
 
+from fastmcp_pr_review.github_client import GitHubPRClient  # noqa: TC001
 from fastmcp_pr_review.models import (
     CommentCategory,
     PRReviewResult,
@@ -31,36 +32,35 @@ from fastmcp_pr_review.models import (
     compute_verdict,
 )
 
-if TYPE_CHECKING:
-    from fastmcp import Context
-
-    from fastmcp_pr_review.github_client import GitHubPRClient
-
 # ---------------------------------------------------------------------------
-# Output model for each file — the LLM fills this in via structured output
+# Output model for each file -- the LLM fills this in via structured output
 # ---------------------------------------------------------------------------
 
 
 class Finding(BaseModel):
     """A single issue found during review."""
 
-    path: str = Field(description="File path")
-    line: int | None = Field(default=None, description="Line number")
-    end_line: int | None = Field(default=None)
-    severity: Severity
-    category: CommentCategory
+    path: str = Field(description="File path relative to the repo root")
+    line: int | None = Field(default=None, description="Line number where the issue starts")
+    end_line: int | None = Field(default=None, description="End line for multi-line issues")
+    severity: Severity = Field(description="How serious: critical, high, medium, low, nitpick")
+    category: CommentCategory = Field(
+        description="What kind of issue: bug, security, performance, style, etc."
+    )
     title: str = Field(description="Short (<80 char) title")
     body: str = Field(description="What's wrong and what could go wrong")
     why: str = Field(description="Why this matters")
-    suggested_code: str | None = Field(default=None)
-    confidence: int = Field(ge=0, le=100)
+    suggested_code: str | None = Field(
+        default=None, description="Replacement code if you have a concrete fix"
+    )
+    confidence: int = Field(ge=0, le=100, description="How sure you are (0-100)")
 
 
 class FileReview(BaseModel):
-    """result_type for per-file ctx.sample() — what the LLM returns."""
+    """result_type for per-file ctx.sample() -- what the LLM returns."""
 
-    filename: str
-    findings: list[Finding] = Field(default_factory=list)
+    filename: str = Field(description="Path of the file being reviewed")
+    findings: list[Finding] = Field(default_factory=list, description="Issues found in this file")
     summary: str = Field(description="1-2 sentence summary of this file's changes")
 
 
@@ -79,15 +79,21 @@ error_handling, testing, or maintainability
 - Rate your confidence 0-100
 
 You have tools to explore the codebase:
-- get_file_contents(path) — read any file in the repo
-- lookup_file_diff(path) — see the diff for another changed file
-- list_pr_files() — list all files changed in this PR
+- get_file_contents(path) -- read any file in the repo
+- lookup_file_diff(path) -- see the diff for another changed file
+- list_pr_files() -- list all files changed in this PR
 
 Use these tools when you need context beyond the current file's diff.
 For example, check if a function you're concerned about is tested,
-or if input validation happens in a caller.
+or if input validation happens in a caller. USE the tools before
+flagging an issue -- verify your concern is real.
 
-Finding no issues is a valid outcome — do not invent problems."""
+Only flag issues that could cause bugs, security problems, or breakage.
+Do not flag style preferences or code organization choices that are
+clearly intentional. If you cannot describe a concrete failure scenario
+for a finding, do not include it.
+
+Finding no issues is a valid outcome -- do not invent problems."""
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +125,9 @@ async def per_file_review(
     reviewable_files = [f for f in timeline.files if f.patch]
 
     # -- Define tools the LLM can call during review --
+    # These are defined outside the per-file loop because they close over
+    # `timeline` (shared PR state). Each ctx.sample() call gets the same
+    # three tools; only the prompt changes per file.
 
     async def get_file_contents(filepath: str) -> str:
         """Read the current contents of any file in the repository."""
@@ -172,7 +181,7 @@ async def per_file_review(
             result_type=FileReview,
             tools=[get_file_contents, lookup_file_diff, list_pr_files],
             temperature=0.2,
-            max_tokens=4096,
+            max_tokens=16384,
         )
 
         file_reviews.append(result.result)
@@ -212,14 +221,18 @@ def _aggregate(
                 )
             )
 
-    sev = Counter(c.severity.value for c in comments)
-    n_crit, n_high = sev.get("critical", 0), sev.get("high", 0)
-    risk, health = compute_scores(dict(sev))
+    # Compute severity and category distributions once
+    by_severity = Counter(c.severity.value for c in comments)
+    by_category = Counter(c.category.value for c in comments)
+
+    n_crit = by_severity.get("critical", 0)
+    n_high = by_severity.get("high", 0)
+    risk, health = compute_scores(dict(by_severity))
 
     summaries = [f"- **{fr.filename}**: {fr.summary}" for fr in file_reviews if fr.summary]
 
     return PRReviewResult(
-        verdict=compute_verdict(n_crit, n_high, sev.get("medium", 0)),
+        verdict=compute_verdict(n_crit, n_high, by_severity.get("medium", 0)),
         summary=(
             f"Reviewed {len(file_reviews)} of {total_files} files "
             f"({len(comments)} comments, "
@@ -232,7 +245,7 @@ def _aggregate(
         files_skipped=total_files - len(file_reviews),
         stats=ReviewStats(
             total_comments=len(comments),
-            by_severity=dict(sev),
-            by_category=dict(Counter(c.category.value for c in comments)),
+            by_severity=dict(by_severity),
+            by_category=dict(by_category),
         ),
     )

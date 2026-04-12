@@ -19,14 +19,14 @@ from fastmcp_pr_review.models import (
     Severity,
 )
 from fastmcp_pr_review.v3_production import (
-    ExploreResult,
     FileFindings,
     FilterBatchResult,
     FilteredChunk,
     PotentialFinding,
-    VerifiedFinding,
+    VerifyComplete,
     _aggregate,
     _prefilter,
+    _ReviewCtx,
     _verify_findings,
     production_review,
 )
@@ -88,6 +88,26 @@ def _make_comment(confidence: int = 90) -> ReviewComment:
     )
 
 
+def _make_rctx(
+    gh: object | None = None,
+    ctx: object | None = None,
+    concurrency: int = 1,
+) -> _ReviewCtx:
+    if gh is None:
+        gh = MagicMock()
+        gh.get_file_contents = AsyncMock(return_value="contents")
+    if ctx is None:
+        ctx = MagicMock()
+        ctx.sample = AsyncMock()
+    return _ReviewCtx(
+        gh=gh,  # ty: ignore[invalid-argument-type]
+        ctx=ctx,  # ty: ignore[invalid-argument-type]
+        repo="o/r",
+        timeline=_make_timeline(),
+        concurrency=concurrency,
+    )
+
+
 class TestPrefilter:
     def test_skips_binary(self) -> None:
         files = [
@@ -125,22 +145,12 @@ class TestPrefilter:
 
 class TestVerifyFindings:
     @pytest.mark.asyncio
-    async def test_uses_three_tools(self) -> None:
-        explore_result = ExploreResult(
-            filename="src/main.py",
-            verified=[
-                VerifiedFinding(
-                    original_title="SQL injection",
-                    status="confirmed",
-                    evidence="No sanitization",
-                    comment=_make_comment(),
-                )
-            ],
+    async def test_calls_sample_with_finding_tools(self) -> None:
+        """Verify pass should provide confirm/dismiss + exploration tools."""
+        rctx = _make_rctx()
+        rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
+            return_value=MagicMock(result=VerifyComplete(summary="Done"))
         )
-        ctx = MagicMock()
-        ctx.sample = AsyncMock(return_value=MagicMock(result=explore_result))
-        gh = MagicMock()
-        gh.get_file_contents = AsyncMock(return_value="contents")
 
         findings = [
             FileFindings(
@@ -149,26 +159,26 @@ class TestVerifyFindings:
                 file_summary="Query",
             )
         ]
-        results = await _verify_findings(gh, ctx, findings, _make_timeline(), "o/r", concurrency=1)
+        await _verify_findings(rctx, all_findings=findings)
 
-        assert len(results) == 1
-        assert len(ctx.sample.call_args.kwargs["tools"]) == 3
-        assert ctx.sample.call_args.kwargs["max_tokens"] == 8192
+        call_kwargs = rctx.ctx.sample.call_args.kwargs  # ty: ignore[unresolved-attribute]
+        tool_names = [t.__name__ for t in call_kwargs["tools"]]
+        assert "confirm_finding" in tool_names
+        assert "dismiss_finding" in tool_names
+        assert "get_file_contents" in tool_names
+        assert call_kwargs["result_type"] is VerifyComplete
 
     @pytest.mark.asyncio
     async def test_skips_clean_files(self) -> None:
-        ctx = MagicMock()
-        ctx.sample = AsyncMock()
-        gh = MagicMock()
-
+        rctx = _make_rctx()
         findings = [FileFindings(filename="a.py", findings=[], file_summary="Clean")]
-        results = await _verify_findings(gh, ctx, findings, _make_timeline(), "o/r", concurrency=1)
-        assert results == []
-        ctx.sample.assert_not_awaited()
+        result = await _verify_findings(rctx, all_findings=findings)
+        assert result == []
+        rctx.ctx.sample.assert_not_awaited()  # ty: ignore[unresolved-attribute]
 
 
 class TestAggregate:
-    def test_only_confirmed(self) -> None:
+    def test_with_confirmed_comments(self) -> None:
         findings = [
             FileFindings(
                 filename="a.py",
@@ -176,44 +186,17 @@ class TestAggregate:
                 file_summary="Changes",
             )
         ]
-        explore = [
-            ExploreResult(
-                filename="a.py",
-                verified=[
-                    VerifiedFinding(
-                        original_title="SQL injection",
-                        status="confirmed",
-                        evidence="Confirmed",
-                        comment=_make_comment(),
-                    ),
-                    VerifiedFinding(
-                        original_title="Other",
-                        status="disproved",
-                        evidence="Handled",
-                        comment=None,
-                    ),
-                ],
-            )
-        ]
-        result = _aggregate(findings, explore, 1, 0, 50)
+        result = _aggregate(findings, [_make_comment()], 1, 0, 50)
         assert len(result.comments) == 1
 
-    def test_all_disproved(self) -> None:
-        explore = [
-            ExploreResult(
-                filename="a.py",
-                verified=[
-                    VerifiedFinding(
-                        original_title="False alarm",
-                        status="disproved",
-                        evidence="OK",
-                        comment=None,
-                    )
-                ],
-            )
-        ]
-        result = _aggregate([], explore, 1, 0, 50)
+    def test_empty_comments(self) -> None:
+        result = _aggregate([], [], 1, 0, 50)
         assert result.verdict == ReviewState.APPROVED
+        assert len(result.comments) == 0
+
+    def test_confidence_filter(self) -> None:
+        low = _make_comment(confidence=30)
+        result = _aggregate([], [low], 1, 0, 50)
         assert len(result.comments) == 0
 
 
@@ -229,24 +212,14 @@ class TestFullPipeline:
             findings=[_make_finding()],
             file_summary="Query",
         )
-        explore_result = ExploreResult(
-            filename="src/main.py",
-            verified=[
-                VerifiedFinding(
-                    original_title="SQL injection",
-                    status="confirmed",
-                    evidence="Confirmed",
-                    comment=_make_comment(),
-                )
-            ],
-        )
+        verify_complete = VerifyComplete(summary="All verified")
 
         ctx = MagicMock()
         ctx.sample = AsyncMock(
             side_effect=[
                 MagicMock(result=filter_result),
                 MagicMock(result=file_findings),
-                MagicMock(result=explore_result),
+                MagicMock(result=verify_complete),
             ]
         )
 
@@ -259,5 +232,5 @@ class TestFullPipeline:
         result = await production_review(gh, ctx, "o/r", 1)
 
         assert ctx.sample.await_count == 3
-        assert len(result.comments) == 1
-        assert "verified" in result.summary
+        # No confirmed comments since the mock doesn't actually call confirm_finding
+        assert result.verdict == ReviewState.APPROVED

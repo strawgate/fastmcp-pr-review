@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets
+.env
+.env.*
+*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp

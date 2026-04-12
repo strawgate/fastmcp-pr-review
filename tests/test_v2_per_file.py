@@ -17,7 +17,12 @@ from fastmcp_pr_review.models import (
     ReviewState,
     Severity,
 )
-from fastmcp_pr_review.v2_per_file import FileReview, Finding, per_file_review
+from fastmcp_pr_review.v2_per_file import (
+    FileReview,
+    Finding,
+    _aggregate,
+    per_file_review,
+)
 
 
 def _make_timeline(files: list[PRFile] | None = None) -> PRTimeline:
@@ -83,10 +88,20 @@ class TestPerFileReview:
                 patch="+code",
             ),
             PRFile(
-                filename="b.py", status="added", additions=10, deletions=0, changes=10, patch="+new"
+                filename="b.py",
+                status="added",
+                additions=10,
+                deletions=0,
+                changes=10,
+                patch="+new",
             ),
             PRFile(
-                filename="c.bin", status="added", additions=0, deletions=0, changes=0, patch=None
+                filename="c.bin",
+                status="added",
+                additions=0,
+                deletions=0,
+                changes=0,
+                patch=None,
             ),  # binary, skipped
         ]
         timeline = _make_timeline(files)
@@ -158,3 +173,77 @@ class TestPerFileReview:
         await per_file_review(gh, ctx, "o/r", 1, focus_areas="security")
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "security" in messages
+
+
+class TestAggregate:
+    def test_empty_reviews(self) -> None:
+        """No file reviews should produce an approved result with zero comments."""
+        result = _aggregate([], total_files=0, min_confidence=50)
+        assert result.verdict == ReviewState.APPROVED
+        assert len(result.comments) == 0
+        assert result.stats.total_comments == 0
+
+    def test_filters_below_min_confidence(self) -> None:
+        """Findings below min_confidence should be excluded."""
+        review = FileReview(
+            filename="x.py",
+            findings=[
+                Finding(
+                    path="x.py",
+                    line=1,
+                    severity=Severity.HIGH,
+                    category=CommentCategory.BUG,
+                    title="Low conf",
+                    body="b",
+                    why="w",
+                    confidence=20,
+                ),
+                Finding(
+                    path="x.py",
+                    line=2,
+                    severity=Severity.MEDIUM,
+                    category=CommentCategory.LOGIC,
+                    title="High conf",
+                    body="b",
+                    why="w",
+                    confidence=80,
+                ),
+            ],
+            summary="Mixed",
+        )
+        result = _aggregate([review], total_files=1, min_confidence=50)
+        assert len(result.comments) == 1
+        assert result.comments[0].title == "High conf"
+
+    def test_severity_and_category_counts(self) -> None:
+        """Stats should correctly tally severity and category distributions."""
+        review = FileReview(
+            filename="a.py",
+            findings=[
+                Finding(
+                    path="a.py",
+                    line=1,
+                    severity=Severity.HIGH,
+                    category=CommentCategory.BUG,
+                    title="Bug 1",
+                    body="b",
+                    why="w",
+                    confidence=90,
+                ),
+                Finding(
+                    path="a.py",
+                    line=2,
+                    severity=Severity.HIGH,
+                    category=CommentCategory.SECURITY,
+                    title="Sec 1",
+                    body="b",
+                    why="w",
+                    confidence=90,
+                ),
+            ],
+            summary="Two highs",
+        )
+        result = _aggregate([review], total_files=1, min_confidence=50)
+        assert result.stats.by_severity == {"high": 2}
+        assert result.stats.by_category == {"bug": 1, "security": 1}
+        assert result.verdict == ReviewState.CHANGES_REQUESTED

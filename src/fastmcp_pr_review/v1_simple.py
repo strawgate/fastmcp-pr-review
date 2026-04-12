@@ -6,25 +6,17 @@ Demonstrates the simplest FastMCP sampling pattern:
   - No tool calling
 
 The LLM receives the full diff in one prompt and returns a structured
-PRReviewResult with verdict, comments, and scores — all validated
+PRReviewResult with verdict, comments, and scores -- all validated
 against the Pydantic schema automatically by FastMCP.
 """
 
-from __future__ import annotations
+from fastmcp import Context
 
-from typing import TYPE_CHECKING
-
-from fastmcp_pr_review.models import (
-    PRReviewResult,
-)
-
-if TYPE_CHECKING:
-    from fastmcp import Context
-
-    from fastmcp_pr_review.github_client import GitHubPRClient
+from fastmcp_pr_review.github_client import GitHubPRClient
+from fastmcp_pr_review.models import PRReviewResult
 
 # ---------------------------------------------------------------------------
-# Prompt — inlined so you can read the full example in one file
+# Prompt -- inlined so you can read the full example in one file
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
@@ -42,12 +34,25 @@ For each issue found, assign:
 - category: bug, security, performance, style, logic, error_handling, testing, maintainability
 - confidence: 0-100 score
 
+Verdict rules:
+- CHANGES_REQUESTED: only for critical issues or 2+ high-severity issues
+- COMMENTED: for 1 high or 3+ medium issues
+- APPROVED: for everything else (low, nitpick, or no issues)
+A PR with only low/nitpick findings should ALWAYS be APPROVED.
+
+Only flag issues that could cause bugs, security problems, or breakage.
+Do NOT flag style preferences, code organization choices, or patterns
+that are clearly intentional by the author. If you cannot describe a
+concrete failure scenario, it is not worth flagging.
+
 Be specific. Reference file paths and line numbers.
-Finding no issues is a valid outcome — do not invent problems."""
+Explain *why* each issue matters and what could go wrong.
+Suggest a fix (as a code snippet) whenever possible.
+Finding no issues is a valid outcome -- do not invent problems."""
 
 
 # ---------------------------------------------------------------------------
-# The review function — this is the whole thing
+# The review function -- this is the whole thing
 # ---------------------------------------------------------------------------
 
 
@@ -66,23 +71,21 @@ async def simple_review(
     2. Call ctx.sample() with result_type=PRReviewResult
     3. FastMCP ensures the response matches the Pydantic schema
     """
-    # Fetch PR data
+    # Fetch PR metadata + file patches in one call (no separate diff needed)
     timeline = await gh.get_timeline(repo, pr_number)
-    diff = await gh.get_diff(repo, pr_number)
 
-    # Build the prompt — just markdown with the diff inlined
+    # Build the prompt -- just markdown with per-file patches inlined
     pr = timeline.pr
     patches = "\n\n".join(
         f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```" for f in timeline.files if f.patch
     )
-    diff_context = patches or (diff[:100_000] if len(diff) > 100_000 else diff)
 
     user_prompt = (
         f"## Pull Request: {pr.title} (#{pr.number})\n"
         f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
         f"Stats: +{pr.additions} -{pr.deletions} across {pr.changed_files} files\n\n"
         f"### Description\n{pr.body or '(no description)'}\n\n"
-        f"### Diff\n{diff_context}\n\n"
+        f"### Diff\n{patches or '(no patches available)'}\n\n"
         "Review this PR and provide your structured assessment."
     )
 
@@ -102,7 +105,7 @@ async def simple_review(
         system_prompt=SYSTEM_PROMPT,
         result_type=PRReviewResult,
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=16384,
     )
 
     return result.result
