@@ -1,13 +1,13 @@
-"""v2: Per-file review with sampling tools.
+"""v2: Batched file review with sampling tools.
 
 Demonstrates the natural next step beyond v1:
-  - Loop over changed files, calling ctx.sample() for each one
+  - Group files into batches by size, calling ctx.sample() per batch
   - Give the LLM tools it can call during review (tool calling)
-  - Structured output per file, aggregated into a final result
+  - Structured output per batch, aggregated into a final result
 
 New concepts beyond v1:
   - tools=[...] parameter -- the LLM can call Python functions mid-review
-  - Per-file iteration -- each file gets focused attention
+  - Size-based batching -- small files reviewed together, large files alone
   - Async tool -- get_file_contents reads from the repo via GitHub API
 
 This is what you'd build after spending a couple days iterating on v1:
@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from fastmcp_pr_review.github_client import GitHubPRClient  # noqa: TC001
 from fastmcp_pr_review.models import (
     CommentCategory,
+    PRFile,
     PRReviewResult,
     ReviewComment,
     ReviewStats,
@@ -33,35 +34,53 @@ from fastmcp_pr_review.models import (
 )
 
 # ---------------------------------------------------------------------------
-# Output model for each file -- the LLM fills this in via structured output
+# Output models -- the LLM fills these in via structured output
 # ---------------------------------------------------------------------------
 
 
 class Finding(BaseModel):
     """A single issue found during review."""
 
-    path: str = Field(description="File path relative to the repo root")
-    line: int | None = Field(default=None, description="Line number where the issue starts")
-    end_line: int | None = Field(default=None, description="End line for multi-line issues")
-    severity: Severity = Field(description="How serious: critical, high, medium, low, nitpick")
+    path: str = Field(description="File path")
+    line: int | None = Field(
+        default=None, description="Line number where the issue starts"
+    )
+    end_line: int | None = Field(
+        default=None, description="End line for multi-line issues"
+    )
+    severity: Severity = Field(
+        description="How serious: critical, high, medium, low, nitpick"
+    )
     category: CommentCategory = Field(
-        description="What kind of issue: bug, security, performance, style, etc."
+        description="What kind of issue: bug, security, performance, etc."
     )
     title: str = Field(description="Short (<80 char) title")
     body: str = Field(description="What's wrong and what could go wrong")
     why: str = Field(description="Why this matters")
     suggested_code: str | None = Field(
-        default=None, description="Replacement code if you have a concrete fix"
+        default=None, description="Replacement code if you have a fix"
     )
-    confidence: int = Field(ge=0, le=100, description="How sure you are (0-100)")
+    confidence: int = Field(ge=0, le=100, description="How sure you are")
 
 
 class FileReview(BaseModel):
-    """result_type for per-file ctx.sample() -- what the LLM returns."""
+    """Review results for a single file within a batch."""
 
     filename: str = Field(description="Path of the file being reviewed")
-    findings: list[Finding] = Field(default_factory=list, description="Issues found in this file")
-    summary: str = Field(description="1-2 sentence summary of this file's changes")
+    findings: list[Finding] = Field(
+        default_factory=list, description="Issues found in this file"
+    )
+    summary: str = Field(
+        description="1-2 sentence summary of this file's changes"
+    )
+
+
+class BatchReview(BaseModel):
+    """result_type for batched ctx.sample() -- reviews for multiple files."""
+
+    files: list[FileReview] = Field(
+        description="One review per file in the batch"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +88,9 @@ class FileReview(BaseModel):
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are an expert code reviewer analyzing a single file from a pull request.
+You are an expert code reviewer analyzing files from a pull request.
 
-Review the diff and produce structured findings. For each issue:
-- Explain what's wrong (body) and why it matters (why)
+Review each file's diff and produce structured findings. For each issue:
 - Assign severity AFTER investigation: critical, high, medium, low, nitpick
 - Assign a category: bug, security, performance, style, logic, \
 error_handling, testing, or maintainability
@@ -101,7 +119,56 @@ Do NOT flag:
 - Missing tests for trivial getters/setters or auto-generated code
 - Style/naming unless it violates documented project guidelines
 
-Finding no issues is a valid outcome -- do not invent problems."""
+Produce one FileReview per file. Finding no issues is valid."""
+
+
+# ---------------------------------------------------------------------------
+# Batching -- group files by total patch size
+# ---------------------------------------------------------------------------
+
+MAX_BATCH_FILES = 10
+MAX_BATCH_BYTES = 10_000
+
+
+def _make_batches(files: list[PRFile]) -> list[list[PRFile]]:
+    """Group files into batches by size.
+
+    Small files get reviewed together. Large files get their own batch.
+    Each batch stays under MAX_BATCH_FILES files and MAX_BATCH_BYTES of
+    total patch content.
+    """
+    batches: list[list[PRFile]] = []
+    current_batch: list[PRFile] = []
+    current_size = 0
+
+    for f in files:
+        patch_size = len(f.patch or "")
+
+        # If this single file exceeds the limit, give it its own batch
+        if patch_size > MAX_BATCH_BYTES:
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            batches.append([f])
+            continue
+
+        # Would adding this file exceed the batch limits?
+        if (
+            current_size + patch_size > MAX_BATCH_BYTES
+            or len(current_batch) >= MAX_BATCH_FILES
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_size = 0
+
+        current_batch.append(f)
+        current_size += patch_size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
 
 
 # ---------------------------------------------------------------------------
@@ -118,24 +185,21 @@ async def per_file_review(
     focus_areas: str | None = None,
     min_confidence: int = 50,
 ) -> PRReviewResult:
-    """Review a PR file-by-file, giving the LLM tools to explore the repo.
+    """Review a PR in batches, giving the LLM tools to explore the repo.
 
-    For each changed file:
-    1. Build a prompt with the file's diff + PR context
-    2. Call ctx.sample() with tools the LLM can use
-    3. Collect the structured findings
-    4. Aggregate into a final PRReviewResult
+    Files are grouped into batches by size (max 10 files or 10KB of
+    patch content per batch). Each batch gets one ctx.sample() call
+    with tools the LLM can use for cross-file context.
     """
     timeline = await gh.get_timeline(repo, pr_number)
     pr = timeline.pr
 
-    # Skip files with no patch (binary files, renames without content change)
-    reviewable_files = [f for f in timeline.files if f.patch]
+    # Skip files with no patch (binary files, renames without content)
+    reviewable = [f for f in timeline.files if f.patch]
+    batches = _make_batches(reviewable)
 
-    # -- Define tools the LLM can call during review --
-    # These are defined outside the per-file loop because they close over
-    # `timeline` (shared PR state). Each ctx.sample() call gets the same
-    # three tools; only the prompt changes per file.
+    # -- Tools the LLM can call during review --
+    # Defined once, shared across all batch calls.
 
     async def get_file_contents(filepath: str) -> str:
         """Read the current contents of any file in the repository."""
@@ -151,26 +215,36 @@ async def per_file_review(
     def list_pr_files() -> str:
         """List all files changed in this PR."""
         return "\n".join(
-            f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in timeline.files
+            f"  {f.status:>10} {f.filename} "
+            f"(+{f.additions} -{f.deletions})"
+            for f in timeline.files
         )
 
-    # -- Review each file --
+    # -- Review each batch --
 
-    file_reviews: list[FileReview] = []
+    all_file_reviews: list[FileReview] = []
 
-    for file in reviewable_files:
+    for batch in batches:
+        # Build one prompt with all files in the batch
+        file_sections = []
+        for file in batch:
+            file_sections.append(
+                f"<file_diff>\n"
+                f"File: {file.filename} ({file.status}, "
+                f"+{file.additions} -{file.deletions})\n"
+                f"```diff\n{file.patch}\n```\n"
+                f"</file_diff>"
+            )
+
         user_prompt = (
             f"<context>\n"
             f"PR #{pr.number}: {pr.title}\n"
-            f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
+            f"Author: @{pr.author.login} | "
+            f"{pr.head_ref} -> {pr.base_ref}\n"
             f"Description: {pr.body or '(none)'}\n"
             f"</context>\n\n"
-            f"<file_diff>\n"
-            f"File: {file.filename} ({file.status}, "
-            f"+{file.additions} -{file.deletions})\n"
-            f"```diff\n{file.patch}\n```\n"
-            f"</file_diff>\n\n"
-            f"Review this file."
+            + "\n\n".join(file_sections)
+            + "\n\nReview each file above."
         )
 
         if focus_areas:
@@ -179,23 +253,22 @@ async def per_file_review(
         # ---------------------------------------------------------------
         # ctx.sample() with structured output + TOOL CALLING
         # ---------------------------------------------------------------
-        # The LLM can call get_file_contents(), lookup_file_diff(), or
-        # list_pr_files() at any point during its response. FastMCP
-        # executes the tool, feeds the result back, and the LLM continues.
-        # When done exploring, it returns a FileReview via structured output.
+        # The LLM reviews all files in the batch at once. It can call
+        # tools at any point to explore the codebase. When done, it
+        # returns a BatchReview with one FileReview per file.
         result = await ctx.sample(
             messages=user_prompt,
             system_prompt=SYSTEM_PROMPT,
-            result_type=FileReview,
+            result_type=BatchReview,
             tools=[get_file_contents, lookup_file_diff, list_pr_files],
             temperature=0.2,
             max_tokens=16384,
         )
 
-        file_reviews.append(result.result)
+        all_file_reviews.extend(result.result.files)
 
-    # -- Aggregate all file reviews into a single PRReviewResult --
-    return _aggregate(file_reviews, len(timeline.files), min_confidence)
+    # -- Aggregate all reviews into a single PRReviewResult --
+    return _aggregate(all_file_reviews, len(timeline.files), min_confidence)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +302,6 @@ def _aggregate(
                 )
             )
 
-    # Compute severity and category distributions once
     by_severity = Counter(c.severity.value for c in comments)
     by_category = Counter(c.category.value for c in comments)
 
@@ -237,14 +309,21 @@ def _aggregate(
     n_high = by_severity.get("high", 0)
     risk, health = compute_scores(dict(by_severity))
 
-    summaries = [f"- **{fr.filename}**: {fr.summary}" for fr in file_reviews if fr.summary]
+    summaries = [
+        f"- **{fr.filename}**: {fr.summary}"
+        for fr in file_reviews
+        if fr.summary
+    ]
 
     return PRReviewResult(
-        verdict=compute_verdict(n_crit, n_high, by_severity.get("medium", 0)),
+        verdict=compute_verdict(
+            n_crit, n_high, by_severity.get("medium", 0)
+        ),
         summary=(
             f"Reviewed {len(file_reviews)} of {total_files} files "
             f"({len(comments)} comments, "
-            f"{n_crit} critical, {n_high} high).\n" + "\n".join(summaries)
+            f"{n_crit} critical, {n_high} high).\n"
+            + "\n".join(summaries)
         ),
         comments=comments,
         risk_score=risk,

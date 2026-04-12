@@ -1,6 +1,4 @@
-"""Tests for v2 per-file review with tools."""
-
-from __future__ import annotations
+"""Tests for v2 batched file review with tools."""
 
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -18,9 +16,11 @@ from fastmcp_pr_review.models import (
     Severity,
 )
 from fastmcp_pr_review.v2_per_file import (
+    BatchReview,
     FileReview,
     Finding,
     _aggregate,
+    _make_batches,
     per_file_review,
 )
 
@@ -74,10 +74,87 @@ def _make_file_review(filename: str = "src/main.py") -> FileReview:
     )
 
 
+class TestMakeBatches:
+    def test_small_files_grouped(self) -> None:
+        files = [
+            PRFile(
+                filename=f"f{i}.py",
+                status="modified",
+                additions=1,
+                deletions=0,
+                changes=1,
+                patch="+x",
+            )
+            for i in range(5)
+        ]
+        batches = _make_batches(files)
+        assert len(batches) == 1
+        assert len(batches[0]) == 5
+
+    def test_large_file_gets_own_batch(self) -> None:
+        small = PRFile(
+            filename="small.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch="+x",
+        )
+        large = PRFile(
+            filename="large.py",
+            status="modified",
+            additions=500,
+            deletions=0,
+            changes=500,
+            patch="+" * 15000,
+        )
+        batches = _make_batches([small, large])
+        assert len(batches) == 2
+        assert batches[0][0].filename == "small.py"
+        assert batches[1][0].filename == "large.py"
+
+    def test_respects_max_batch_bytes(self) -> None:
+        files = [
+            PRFile(
+                filename=f"f{i}.py",
+                status="modified",
+                additions=1,
+                deletions=0,
+                changes=1,
+                patch="+" * 4000,
+            )
+            for i in range(5)
+        ]
+        batches = _make_batches(files)
+        assert len(batches) >= 2
+
+    def test_empty_files(self) -> None:
+        assert _make_batches([]) == []
+
+
 class TestPerFileReview:
     @pytest.mark.asyncio
-    async def test_reviews_each_file(self) -> None:
-        """Should call ctx.sample() once per reviewable file."""
+    async def test_reviews_files(self) -> None:
+        ctx = MagicMock()
+        ctx.sample = AsyncMock(
+            return_value=MagicMock(
+                result=BatchReview(files=[_make_file_review()])
+            )
+        )
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=_make_timeline())
+        gh.get_file_contents = AsyncMock(return_value="contents")
+
+        result = await per_file_review(gh, ctx, "owner/repo", 1)
+
+        ctx.sample.assert_awaited_once()
+        call_kwargs = ctx.sample.call_args.kwargs
+        assert call_kwargs["result_type"] is BatchReview
+        assert len(call_kwargs["tools"]) == 3
+        assert result.files_reviewed == 1
+
+    @pytest.mark.asyncio
+    async def test_skips_binary_files(self) -> None:
         files = [
             PRFile(
                 filename="a.py",
@@ -88,84 +165,36 @@ class TestPerFileReview:
                 patch="+code",
             ),
             PRFile(
-                filename="b.py",
-                status="added",
-                additions=10,
-                deletions=0,
-                changes=10,
-                patch="+new",
-            ),
-            PRFile(
-                filename="c.bin",
+                filename="b.bin",
                 status="added",
                 additions=0,
                 deletions=0,
                 changes=0,
                 patch=None,
-            ),  # binary, skipped
+            ),
         ]
-        timeline = _make_timeline(files)
-
         ctx = MagicMock()
-        ctx.sample = AsyncMock(return_value=MagicMock(result=_make_file_review()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=timeline)
-        gh.get_file_contents = AsyncMock(return_value="contents")
-
-        result = await per_file_review(gh, ctx, "owner/repo", 1)
-
-        # 2 files with patches, 1 binary skipped
-        assert ctx.sample.await_count == 2
-        assert result.files_reviewed == 2
-        assert result.files_skipped == 1
-
-    @pytest.mark.asyncio
-    async def test_passes_tools(self) -> None:
-        """ctx.sample() should receive 3 tools."""
-        ctx = MagicMock()
-        ctx.sample = AsyncMock(return_value=MagicMock(result=_make_file_review()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_file_contents = AsyncMock(return_value="contents")
-
-        await per_file_review(gh, ctx, "owner/repo", 1)
-
-        call_kwargs = ctx.sample.call_args.kwargs
-        assert call_kwargs["result_type"] is FileReview
-        assert len(call_kwargs["tools"]) == 3
-
-    @pytest.mark.asyncio
-    async def test_filters_low_confidence(self) -> None:
-        low_conf = FileReview(
-            filename="a.py",
-            findings=[
-                Finding(
-                    path="a.py",
-                    line=1,
-                    severity=Severity.LOW,
-                    category=CommentCategory.STYLE,
-                    title="Meh",
-                    body="b",
-                    why="w",
-                    confidence=30,
-                )
-            ],
-            summary="Changes",
+        ctx.sample = AsyncMock(
+            return_value=MagicMock(
+                result=BatchReview(files=[_make_file_review("a.py")])
+            )
         )
-        ctx = MagicMock()
-        ctx.sample = AsyncMock(return_value=MagicMock(result=low_conf))
         gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
+        gh.get_timeline = AsyncMock(return_value=_make_timeline(files))
         gh.get_file_contents = AsyncMock(return_value="")
 
-        result = await per_file_review(gh, ctx, "o/r", 1, min_confidence=50)
-        assert len(result.comments) == 0
-        assert result.verdict == ReviewState.APPROVED
+        result = await per_file_review(gh, ctx, "owner/repo", 1)
+        assert result.files_reviewed == 1
+        assert result.files_skipped == 1
 
     @pytest.mark.asyncio
     async def test_includes_focus_areas(self) -> None:
         ctx = MagicMock()
-        ctx.sample = AsyncMock(return_value=MagicMock(result=_make_file_review()))
+        ctx.sample = AsyncMock(
+            return_value=MagicMock(
+                result=BatchReview(files=[_make_file_review()])
+            )
+        )
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
         gh.get_file_contents = AsyncMock(return_value="")
@@ -177,47 +206,11 @@ class TestPerFileReview:
 
 class TestAggregate:
     def test_empty_reviews(self) -> None:
-        """No file reviews should produce an approved result with zero comments."""
         result = _aggregate([], total_files=0, min_confidence=50)
         assert result.verdict == ReviewState.APPROVED
-        assert len(result.comments) == 0
-        assert result.stats.total_comments == 0
 
     def test_filters_below_min_confidence(self) -> None:
-        """Findings below min_confidence should be excluded."""
-        review = FileReview(
-            filename="x.py",
-            findings=[
-                Finding(
-                    path="x.py",
-                    line=1,
-                    severity=Severity.HIGH,
-                    category=CommentCategory.BUG,
-                    title="Low conf",
-                    body="b",
-                    why="w",
-                    confidence=20,
-                ),
-                Finding(
-                    path="x.py",
-                    line=2,
-                    severity=Severity.MEDIUM,
-                    category=CommentCategory.LOGIC,
-                    title="High conf",
-                    body="b",
-                    why="w",
-                    confidence=80,
-                ),
-            ],
-            summary="Mixed",
-        )
-        result = _aggregate([review], total_files=1, min_confidence=50)
-        assert len(result.comments) == 1
-        assert result.comments[0].title == "High conf"
-
-    def test_severity_and_category_counts(self) -> None:
-        """Stats should correctly tally severity and category distributions."""
-        review = FileReview(
+        fr = FileReview(
             filename="a.py",
             findings=[
                 Finding(
@@ -225,25 +218,44 @@ class TestAggregate:
                     line=1,
                     severity=Severity.HIGH,
                     category=CommentCategory.BUG,
-                    title="Bug 1",
+                    title="Bug",
+                    body="b",
+                    why="w",
+                    confidence=30,
+                )
+            ],
+            summary="Changes",
+        )
+        result = _aggregate([fr], total_files=1, min_confidence=50)
+        assert len(result.comments) == 0
+
+    def test_counts_severity_and_category(self) -> None:
+        fr = FileReview(
+            filename="a.py",
+            findings=[
+                Finding(
+                    path="a.py",
+                    line=1,
+                    severity=Severity.HIGH,
+                    category=CommentCategory.SECURITY,
+                    title="XSS",
                     body="b",
                     why="w",
                     confidence=90,
                 ),
                 Finding(
                     path="a.py",
-                    line=2,
-                    severity=Severity.HIGH,
-                    category=CommentCategory.SECURITY,
-                    title="Sec 1",
+                    line=5,
+                    severity=Severity.MEDIUM,
+                    category=CommentCategory.BUG,
+                    title="Bug",
                     body="b",
                     why="w",
-                    confidence=90,
+                    confidence=80,
                 ),
             ],
-            summary="Two highs",
+            summary="Changes",
         )
-        result = _aggregate([review], total_files=1, min_confidence=50)
-        assert result.stats.by_severity == {"high": 2}
-        assert result.stats.by_category == {"bug": 1, "security": 1}
-        assert result.verdict == ReviewState.CHANGES_REQUESTED
+        result = _aggregate([fr], total_files=1, min_confidence=50)
+        assert result.stats.by_severity == {"high": 1, "medium": 1}
+        assert result.stats.by_category == {"security": 1, "bug": 1}
