@@ -347,6 +347,8 @@ For each finding:
 - Every finding MUST be either confirmed or dismissed EXACTLY ONCE.
   Do not call confirm_finding or dismiss_finding more than once per finding.
 - When confirming, provide an updated confidence score based on evidence.
+- You can call multiple tools per turn (5-10 is fine). For example, read
+  several files at once, or confirm/dismiss multiple findings in one turn.
 </guidelines>
 
 <dismiss_criteria>
