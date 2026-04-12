@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -100,6 +101,8 @@ class _ReviewCtx:
     focus_areas: str | None = None
     intensity: str = "balanced"
     concurrency: int = 3
+    project_context: str = ""
+    linked_issues: list[str] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -371,6 +374,130 @@ than confirming it and wasting the author's time.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Pass 0: Project context + linked issues
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Well-known files to read for project context, in priority order.
+# We read whichever exist and concatenate (truncated) into a context string.
+_PROJECT_DOC_PATHS = [
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "CODE_STYLE.md",
+    ".coderabbit.yaml",
+    ".github/copilot-instructions.md",
+]
+
+_MAX_DOC_CHARS = 2000  # per file — enough for key info, not overwhelming
+_MAX_PROJECT_CONTEXT = 8000  # total cap across all docs
+
+
+async def _gather_project_context(
+    gh: GitHubPRClient,
+    repo: str,
+    ref: str,
+) -> str:
+    """Read well-known project docs to understand the codebase.
+
+    Tries each path in _PROJECT_DOC_PATHS. Files that don't exist are
+    silently skipped. Each file is truncated to _MAX_DOC_CHARS.
+    """
+    docs: list[str] = []
+    total = 0
+
+    # Fetch all in parallel
+    results = await asyncio.gather(
+        *(gh.get_file_contents(repo, path, ref) for path in _PROJECT_DOC_PATHS),
+        return_exceptions=True,
+    )
+
+    for path, result in zip(_PROJECT_DOC_PATHS, results, strict=True):
+        if isinstance(result, Exception):
+            continue
+        content = str(result)
+        if not content or content.startswith("(unable to read"):
+            continue
+
+        # Truncate long docs
+        if len(content) > _MAX_DOC_CHARS:
+            content = content[:_MAX_DOC_CHARS] + "\n... (truncated)"
+
+        if total + len(content) > _MAX_PROJECT_CONTEXT:
+            break
+
+        docs.append(f"### {path}\n{content}")
+        total += len(content)
+        logger.debug("v3: read project doc %s (%d chars)", path, len(content))
+
+    if docs:
+        logger.info("v3: pass 0 — read %d project docs (%d chars)", len(docs), total)
+    else:
+        logger.info("v3: pass 0 — no project docs found")
+
+    return "\n\n".join(docs)
+
+
+_ISSUE_REF_PATTERN = re.compile(
+    r"(?:"
+    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"  # "fixes #123"
+    r")?#(\d+)",
+    re.IGNORECASE,
+)
+
+
+async def _extract_linked_issues(
+    gh: GitHubPRClient,
+    repo: str,
+    pr_body: str | None,
+    branch_name: str,
+) -> list[str]:
+    """Extract and fetch linked GitHub issues from PR body and branch name.
+
+    Parses patterns like #123, fixes #456, closes #789 from the PR body.
+    Also checks the branch name for issue numbers (e.g. fix/issue-123).
+    """
+    refs: set[int] = set()
+
+    # Parse from PR body
+    if pr_body:
+        for match in _ISSUE_REF_PATTERN.finditer(pr_body):
+            refs.add(int(match.group(1)))
+
+    # Parse from branch name (e.g. "fix/123", "issue-456", "feat/gh-789")
+    for m in re.finditer(r"(\d+)", branch_name):
+        num = int(m.group(1))
+        if 1 < num < 100000:  # reasonable issue number range
+            refs.add(num)
+
+    if not refs:
+        return []
+
+    # Fetch issue details in parallel
+    async def fetch_issue(num: int) -> str | None:
+        try:
+            owner, repo_name = repo.split("/")
+            resp = await gh._github.rest.issues.async_get(owner, repo_name, num)
+            issue = resp.parsed_data
+            body = (issue.body or "")[:500]
+            return f"**#{num}: {issue.title}** ({issue.state})\n{body}"
+        except Exception:
+            return None
+
+    results = await asyncio.gather(*(fetch_issue(n) for n in sorted(refs)))
+    issues = [r for r in results if r is not None]
+
+    if issues:
+        logger.info(
+            "v3: pass 0 — found %d linked issues: %s",
+            len(issues),
+            sorted(refs),
+        )
+
+    return issues
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -388,35 +515,50 @@ async def production_review(
     concurrency: int = 3,
     min_confidence: int = 50,
 ) -> PRReviewResult:
-    """Production PR review: Filter -> Review -> Verify.
+    """Production PR review: Context -> Filter -> Review -> Verify.
 
-    Pass 1: Gather full context (timeline, prior reviews, existing threads)
+    Pass 0: Read project docs (README, AGENTS.md, etc.) + linked issues
+    Pass 1: Gather PR context (timeline, prior reviews, existing threads)
     Pass 2: Batch-filter files by interest level
     Pass 3: Deep per-file review with tools + verification protocol
     Pass 4: Agentic verification of findings with repo exploration
     """
 
-    # ═══════════════════════════════════════════════════════════════════
-    # PASS 1: Context — gather everything we need
-    # ═══════════════════════════════════════════════════════════════════
-    # Fetch timeline, existing review threads, and prior review bodies
-    # in parallel. Prior reviews tell us what's already been said so we
-    # don't repeat it. Existing threads tell us what's been flagged.
-
     logger.info("v3: reviewing %s#%d (intensity=%s)", repo, pr_number, intensity)
 
-    timeline, comments_by_file, prior_reviews = await asyncio.gather(
-        gh.get_timeline(repo, pr_number),
+    # ═══════════════════════════════════════════════════════════════════
+    # PASS 0 + 1: Project context + PR context (all in parallel)
+    # ═══════════════════════════════════════════════════════════════════
+    # Fetch project docs, PR timeline, threads, prior reviews, and
+    # linked issues all concurrently. Pass 0 (project docs + issues)
+    # runs alongside Pass 1 (PR-specific data) for zero extra latency.
+
+    # We need the timeline first to get head_sha and PR body,
+    # so we do a two-phase gather: timeline first, then everything else.
+    timeline = await gh.get_timeline(repo, pr_number)
+    pr = timeline.pr
+
+    (
+        project_context,
+        linked_issues,
+        comments_by_file,
+        prior_reviews,
+    ) = await asyncio.gather(
+        _gather_project_context(gh, repo, pr.head_sha),
+        _extract_linked_issues(gh, repo, pr.body, pr.head_ref),
         gh.get_review_comments_by_file(repo, pr_number),
         gh.get_prior_review_bodies(repo, pr_number),
     )
 
     total_files = len(timeline.files)
     logger.info(
-        "v3: pass 1 context — %d files, %d existing threads, %d prior reviews",
+        "v3: context — %d files, %d threads, %d prior reviews, "
+        "%d chars project docs, %d linked issues",
         total_files,
         sum(len(v) for v in comments_by_file.values()),
         len(prior_reviews),
+        len(project_context),
+        len(linked_issues),
     )
 
     # Pre-filter: skip binary/generated files (no LLM needed)
@@ -462,6 +604,8 @@ async def production_review(
         focus_areas=focus_areas,
         intensity=intensity,
         concurrency=concurrency,
+        project_context=project_context,
+        linked_issues=linked_issues,
     )
 
     logger.info("v3: pass 3 review — %d files (concurrency=%d)", len(reviewables), concurrency)
@@ -638,6 +782,22 @@ async def _review_one(
             f"\n<focus_hints>\nThe triage pass identified these areas:\n{hints}\n</focus_hints>\n"
         )
 
+    # Format project context and linked issues
+    project_section = ""
+    if rctx.project_context:
+        project_section = f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
+
+    issues_section = ""
+    if rctx.linked_issues:
+        issues_text = "\n\n".join(rctx.linked_issues)
+        issues_section = (
+            f"\n<linked_issues>\n"
+            f"This PR is related to these issues. "
+            f"Review the code against these requirements:\n"
+            f"{issues_text}\n"
+            f"</linked_issues>\n"
+        )
+
     prompt = (
         f"<context>\n"
         f"PR #{pr.number}: {pr.title}\n"
@@ -645,6 +805,8 @@ async def _review_one(
         f"Triage: {classification.interest} — {classification.rationale}\n"
         f"</context>\n\n"
         f"<pr_description>\n{pr.body or '(none)'}\n</pr_description>\n"
+        f"{project_section}"
+        f"{issues_section}"
         f"{hints_section}\n"
         f"<file_diff>\n"
         f"File: {chunk.filename} ({chunk.status})\n"
