@@ -651,6 +651,54 @@ async def _review_one(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+MAX_VERIFY_BATCH_FINDINGS = 10
+MAX_VERIFY_BATCH_BYTES = 5000
+
+
+def _batch_findings_for_verify(
+    all_findings: list[FileFindings],
+) -> list[list[FileFindings]]:
+    """Group files with findings into batches for verification.
+
+    Small finding sets get verified together. Files with many or large
+    findings get their own batch. Empty files are dropped.
+    """
+    with_findings = [f for f in all_findings if f.findings]
+    if not with_findings:
+        return []
+
+    batches: list[list[FileFindings]] = []
+    current: list[FileFindings] = []
+    current_count = 0
+    current_bytes = 0
+
+    for ff in with_findings:
+        n = len(ff.findings)
+        size = sum(len(f.body) + len(f.why) for f in ff.findings)
+
+        if size > MAX_VERIFY_BATCH_BYTES or n > MAX_VERIFY_BATCH_FINDINGS:
+            if current:
+                batches.append(current)
+                current, current_count, current_bytes = [], 0, 0
+            batches.append([ff])
+            continue
+
+        if (
+            current_count + n > MAX_VERIFY_BATCH_FINDINGS
+            or current_bytes + size > MAX_VERIFY_BATCH_BYTES
+        ):
+            batches.append(current)
+            current, current_count, current_bytes = [], 0, 0
+
+        current.append(ff)
+        current_count += n
+        current_bytes += size
+
+    if current:
+        batches.append(current)
+    return batches
+
+
 async def _verify_findings(
     rctx: _ReviewCtx,
     *,
@@ -658,31 +706,30 @@ async def _verify_findings(
 ) -> list[ReviewComment]:
     """Verify findings agentically. Returns only confirmed comments.
 
-    Instead of asking the LLM to produce a complex nested schema,
-    the LLM calls confirm_finding() / dismiss_finding() tools as it
+    Findings from multiple files are batched together for efficiency.
+    The LLM calls confirm_finding() / dismiss_finding() tools as it
     explores. Confirmed findings accumulate in a list via closure.
     """
-    with_findings = [f for f in all_findings if f.findings]
-    if not with_findings:
+    batches = _batch_findings_for_verify(all_findings)
+    if not batches:
         return []
 
     sem = asyncio.Semaphore(rctx.concurrency)
 
-    async def verify(ff: FileFindings) -> list[ReviewComment]:
+    async def verify(batch: list[FileFindings]) -> list[ReviewComment]:
         async with sem:
-            return await _verify_one_file(rctx, findings=ff)
+            return await _verify_batch(rctx, batch=batch)
 
-    results = await asyncio.gather(*(verify(ff) for ff in with_findings))
-    # Flatten list of lists into a single list of confirmed comments
+    results = await asyncio.gather(*(verify(b) for b in batches))
     return [c for batch in results for c in batch]
 
 
-async def _verify_one_file(
+async def _verify_batch(
     rctx: _ReviewCtx,
     *,
-    findings: FileFindings,
+    batch: list[FileFindings],
 ) -> list[ReviewComment]:
-    """Verify one file's findings via agentic tool loop.
+    """Verify a batch of findings across one or more files.
 
     The LLM calls confirm_finding() or dismiss_finding() for each
     suspected issue. Exploration tools let it read files, check
@@ -693,7 +740,6 @@ async def _verify_one_file(
 
     # --- State that accumulates across the tool loop ---
     confirmed: list[ReviewComment] = []
-    dismissed: list[str] = []
 
     # --- Finding management tools ---
 
@@ -727,7 +773,10 @@ async def _verify_one_file(
                 confidence=confidence,
             )
         )
-        return f"Confirmed '{title}' (confidence={confidence}). {len(confirmed)} finding(s) so far."
+        return (
+            f"Confirmed '{title}' (confidence={confidence}). "
+            f"{len(confirmed)} finding(s) confirmed so far."
+        )
 
     def dismiss_finding(title: str, reason: str) -> str:
         """Dismiss a finding — it's not a real issue.
@@ -735,43 +784,44 @@ async def _verify_one_file(
         Call this when your investigation shows the issue doesn't exist,
         is handled elsewhere, or is inconclusive.
         """
-        dismissed.append(f"{title}: {reason}")
         return f"Dismissed '{title}'. Reason: {reason}"
 
-    # --- Build prompt ---
-    findings_text = []
-    for i, f in enumerate(findings.findings):
-        extra = f"\nSuggested fix: {f.suggested_code}" if f.suggested_code else ""
-        findings_text.append(
-            f'<finding index="{i}">\n'
-            f"Title: {f.title}\n"
-            f"Severity: {f.severity} | Category: {f.category}\n"
-            f"Path: {f.path}:{f.line or '?'}\n"
-            f"Body: {f.body}\n"
-            f"Why: {f.why}\n"
-            f"Confidence: {f.confidence}\n"
-            f"Verification needs: {f.verification_needs}"
-            f"{extra}\n"
-            f"</finding>"
-        )
+    # --- Build prompt with all findings across files ---
+    all_findings_text = []
+    finding_idx = 0
+    for ff in batch:
+        all_findings_text.append(f"### File: {ff.filename}\n{ff.file_summary}")
+        for f in ff.findings:
+            extra = f"\nSuggested fix: {f.suggested_code}" if f.suggested_code else ""
+            all_findings_text.append(
+                f'<finding index="{finding_idx}">\n'
+                f"Title: {f.title}\n"
+                f"Severity: {f.severity} | Category: {f.category}\n"
+                f"Path: {f.path}:{f.line or '?'}\n"
+                f"Body: {f.body}\n"
+                f"Why: {f.why}\n"
+                f"Confidence: {f.confidence}\n"
+                f"Verification needs: {f.verification_needs}"
+                f"{extra}\n"
+                f"</finding>"
+            )
+            finding_idx += 1
 
+    total = finding_idx
+    files = ", ".join(ff.filename for ff in batch)
     prompt = (
         f"<context>\n"
         f"PR #{pr.number}: {pr.title} | @{pr.author.login}\n"
-        f"File: {findings.filename}\n"
-        f"Summary: {findings.file_summary}\n"
+        f"Files: {files}\n"
         f"</context>\n\n"
-        f"Verify these {len(findings.findings)} findings.\n"
-        f"For each one, explore the repo, then call confirm_finding() or dismiss_finding().\n\n"
-        + "\n\n".join(findings_text)
+        f"Verify these {total} findings across {len(batch)} file(s).\n"
+        f"For each, explore the repo then call "
+        f"confirm_finding() or dismiss_finding().\n\n" + "\n\n".join(all_findings_text)
     )
 
-    # Combine exploration tools + finding management tools
     exploration_tools = _make_tools(rctx.gh, rctx.timeline, rctx.repo)
 
     # --- Agentic sampling with tool-based result collection ---
-    # The LLM calls confirm_finding/dismiss_finding as it explores.
-    # result_type is just a trivial completion signal.
     await rctx.ctx.sample(
         messages=prompt,
         system_prompt=EXPLORE_SYSTEM_PROMPT,
