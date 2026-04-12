@@ -22,32 +22,43 @@ from fastmcp_pr_review.models import PRReviewResult
 SYSTEM_PROMPT = """\
 You are an expert code reviewer. Analyze the pull request diff and context.
 
-Produce a thorough but concise review. Focus on:
-1. Security vulnerabilities (injection, auth bypass, secrets exposure)
-2. Correctness bugs (logic errors, edge cases, race conditions)
-3. Performance issues (N+1 queries, memory leaks, blocking I/O)
-4. Error handling gaps (unhandled exceptions, missing validation)
-5. Maintainability (unclear naming, dead code, missing abstractions)
+Focus on these categories, in priority order:
+1. Security vulnerabilities (injection, XSS, auth bypass, secrets exposure)
+2. Logic bugs that could cause runtime failures or incorrect behavior
+3. Data integrity issues (race conditions, missing transactions)
+4. Performance bottlenecks (N+1 queries, memory leaks, blocking I/O)
+5. Error handling gaps (unhandled exceptions, missing validation)
+6. Breaking changes to public APIs without migration path
+7. Missing or incorrect test coverage for critical paths
 
-For each issue found, assign:
+For each issue, assign:
 - severity: critical, high, medium, low, or nitpick
-- category: bug, security, performance, style, logic, error_handling, testing, maintainability
-- confidence: 0-100 score
+- category: bug, security, performance, style, logic, \
+error_handling, testing, maintainability
+- confidence: 0-100
+
+Determine severity AFTER investigating the issue, not before.
 
 Verdict rules:
-- CHANGES_REQUESTED: only for critical issues or 2+ high-severity issues
+- CHANGES_REQUESTED: only for critical or 2+ high-severity issues
 - COMMENTED: for 1 high or 3+ medium issues
-- APPROVED: for everything else (low, nitpick, or no issues)
-A PR with only low/nitpick findings should ALWAYS be APPROVED.
+- APPROVED: everything else (low, nitpick, or no issues)
 
-Only flag issues that could cause bugs, security problems, or breakage.
-Do NOT flag style preferences, code organization choices, or patterns
-that are clearly intentional by the author. If you cannot describe a
-concrete failure scenario, it is not worth flagging.
+Silence is better than noise. A false positive wastes the author's time \
+and erodes trust in every future review. Only report findings you could \
+defend in code review -- avoid hedging like "might" or "could possibly."
+
+Do NOT flag:
+- Input sanitized upstream, by framework, or via parameterized queries
+- Null/undefined guarded by type system, assertion, or schema validation
+- Error handling delegated to caller, middleware, or framework
+- Performance concerns where N is demonstrably small
+- Missing tests for trivial getters/setters or auto-generated code
+- Style/naming unless it violates the project's documented guidelines
+- Any issue where you cannot describe a concrete failure scenario
 
 Be specific. Reference file paths and line numbers.
-Explain *why* each issue matters and what could go wrong.
-Suggest a fix (as a code snippet) whenever possible.
+Explain *why* each issue matters and suggest a fix when possible.
 Finding no issues is a valid outcome -- do not invent problems."""
 
 
@@ -71,21 +82,23 @@ async def simple_review(
     2. Call ctx.sample() with result_type=PRReviewResult
     3. FastMCP ensures the response matches the Pydantic schema
     """
-    # Fetch PR metadata + file patches in one call (no separate diff needed)
+    # Fetch PR data
     timeline = await gh.get_timeline(repo, pr_number)
 
-    # Build the prompt -- just markdown with per-file patches inlined
+    # Build the prompt -- just markdown with the diff inlined
     pr = timeline.pr
     patches = "\n\n".join(
         f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```" for f in timeline.files if f.patch
     )
+    diff_context = patches or "(no patches available)"
 
     user_prompt = (
         f"## Pull Request: {pr.title} (#{pr.number})\n"
         f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
-        f"Stats: +{pr.additions} -{pr.deletions} across {pr.changed_files} files\n\n"
+        f"Stats: +{pr.additions} -{pr.deletions} "
+        f"across {pr.changed_files} files\n\n"
         f"### Description\n{pr.body or '(no description)'}\n\n"
-        f"### Diff\n{patches or '(no patches available)'}\n\n"
+        f"### Diff\n{diff_context}\n\n"
         "Review this PR and provide your structured assessment."
     )
 
