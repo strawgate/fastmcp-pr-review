@@ -346,7 +346,19 @@ For each finding:
 - Do NOT invent new findings — only verify what was already found.
 - Every finding MUST be either confirmed or dismissed before you finish.
 - When confirming, provide an updated confidence score based on evidence.
-</guidelines>"""
+</guidelines>
+
+<dismiss_criteria>
+DISMISS a finding if ANY of these apply:
+- The issue is a style preference, not a bug or security concern
+- The concern is handled elsewhere (caller, framework, middleware, types)
+- You cannot construct a concrete failure scenario with specific input/state
+- A senior engineer would close this as "not a real issue"
+- The finding uses hedging language ("might," "could," "possibly") because
+  even after investigation you are not confident it is real
+Silence is better than noise. Dismissing a weak finding is always better
+than confirming it and wasting the author's time.
+</dismiss_criteria>"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
