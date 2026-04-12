@@ -246,25 +246,19 @@ For high/medium files, provide 1-3 *specific* focus hints like:
 Do NOT write generic hints like "review carefully".</focus_hints>"""
 
 
-def _review_system_prompt(intensity: str) -> str:
-    guideline = INTENSITY_GUIDELINES.get(intensity, INTENSITY_GUIDELINES["balanced"])
-    return f"""\
+REVIEW_SYSTEM_PROMPT = """\
 <task>
 You are an expert code reviewer. Analyze this file's diff and produce
 structured findings. Be concise, specific, and actionable.
 Finding no issues is a valid and valuable outcome.
 </task>
 
-<signal_noise>
-{guideline}
-</signal_noise>
-
 <constraints>
 - ONLY comment on code in the diff (added or modified lines)
 - Do NOT re-flag issues that have existing review threads
 - Every finding MUST include a concrete failure scenario
 - Describe what verification would confirm or disprove each finding
-- Check for completeness: if the PR applies a fix across multiple files, verify it was applied everywhere
+- Check completeness: if the PR fixes a pattern across files, verify all instances
 - Use tools to check related files for consistency with the change
 </constraints>
 
@@ -589,10 +583,14 @@ async def _review_one(
 
     tools = _make_tools(rctx.gh, rctx.timeline, rctx.repo)
 
-    # ctx.sample() with tools + verification protocol in the system prompt
+    # Add intensity guideline to the user message (not system prompt)
+    # so the system prompt stays identical across all per-file calls
+    guideline = INTENSITY_GUIDELINES.get(rctx.intensity, INTENSITY_GUIDELINES["balanced"])
+    prompt += f"\n\n<signal_noise>\n{guideline}\n</signal_noise>"
+
     result = await rctx.ctx.sample(
         messages=prompt,
-        system_prompt=_review_system_prompt(rctx.intensity),
+        system_prompt=REVIEW_SYSTEM_PROMPT,
         result_type=FileFindings,
         tools=tools,
         temperature=0.2,
