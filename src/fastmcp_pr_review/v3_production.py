@@ -344,7 +344,8 @@ For each finding:
 <guidelines>
 - Be thorough but efficient. Start with what verification_needs suggests.
 - Do NOT invent new findings — only verify what was already found.
-- Every finding MUST be either confirmed or dismissed before you finish.
+- Every finding MUST be either confirmed or dismissed EXACTLY ONCE.
+  Do not call confirm_finding or dismiss_finding more than once per finding.
 - When confirming, provide an updated confidence score based on evidence.
 </guidelines>
 
@@ -773,9 +774,11 @@ async def _verify_batch(
                 confidence=confidence,
             )
         )
+        already = [c.title for c in confirmed]
         return (
             f"Confirmed '{title}' (confidence={confidence}). "
-            f"{len(confirmed)} finding(s) confirmed so far."
+            f"Already confirmed: {already}. "
+            f"Move on to the next unprocessed finding."
         )
 
     def dismiss_finding(title: str, reason: str) -> str:
@@ -784,7 +787,10 @@ async def _verify_batch(
         Call this when your investigation shows the issue doesn't exist,
         is handled elsewhere, or is inconclusive.
         """
-        return f"Dismissed '{title}'. Reason: {reason}"
+        return (
+            f"Dismissed '{title}'. Reason: {reason}. "
+            f"Move on to the next unprocessed finding."
+        )
 
     # --- Build prompt with all findings across files ---
     all_findings_text = []
