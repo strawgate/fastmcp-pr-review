@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -45,6 +46,8 @@ if TYPE_CHECKING:
 
     from fastmcp_pr_review.github_client import GitHubPRClient
     from fastmcp_pr_review.models import PRFile, PRReviewComment, PRTimeline
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -204,10 +207,12 @@ def _make_tools(
 
     async def get_file_contents(filepath: str) -> str:
         """Read any file in the repo at the PR's head ref."""
+        logger.debug("v3: tool get_file_contents(%s)", filepath)
         return await gh.get_file_contents(repo, filepath, pr.head_sha)
 
     def lookup_file_diff(filename: str) -> str:
         """See another file's diff from this PR."""
+        logger.debug("v3: tool lookup_file_diff(%s)", filename)
         for f in all_files:
             if f.filename == filename:
                 return f.patch or "(no patch available)"
@@ -215,6 +220,7 @@ def _make_tools(
 
     def list_changed_files() -> str:
         """List all files changed in this PR."""
+        logger.debug("v3: tool list_changed_files()")
         return "\n".join(
             f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in all_files
         )
@@ -397,6 +403,8 @@ async def production_review(
     # in parallel. Prior reviews tell us what's already been said so we
     # don't repeat it. Existing threads tell us what's been flagged.
 
+    logger.info("v3: reviewing %s#%d (intensity=%s)", repo, pr_number, intensity)
+
     timeline, comments_by_file, prior_reviews = await asyncio.gather(
         gh.get_timeline(repo, pr_number),
         gh.get_review_comments_by_file(repo, pr_number),
@@ -404,6 +412,12 @@ async def production_review(
     )
 
     total_files = len(timeline.files)
+    logger.info(
+        "v3: pass 1 context — %d files, %d existing threads, %d prior reviews",
+        total_files,
+        sum(len(v) for v in comments_by_file.values()),
+        len(prior_reviews),
+    )
 
     # Pre-filter: skip binary/generated files (no LLM needed)
     chunks = _prefilter(timeline.files, max_files)
@@ -415,8 +429,18 @@ async def production_review(
     # Classify files in batches of 10. All batches run concurrently.
     # This is cheap — just classification, not full review.
 
+    logger.info("v3: pass 2 filter — %d chunks to classify", len(chunks))
     reviewables = await _filter_files(ctx, chunks, timeline, filter_batch_size)
     files_filtered = len(chunks) - len(reviewables)
+    interest_counts = {}
+    for _, fc in reviewables:
+        interest_counts[fc.interest] = interest_counts.get(fc.interest, 0) + 1
+    logger.info(
+        "v3: pass 2 done — %d reviewable (%s), %d filtered",
+        len(reviewables),
+        interest_counts,
+        files_filtered,
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # PASS 3: Review — per-file ctx.sample() + tools + verification
@@ -440,7 +464,14 @@ async def production_review(
         concurrency=concurrency,
     )
 
+    logger.info("v3: pass 3 review — %d files (concurrency=%d)", len(reviewables), concurrency)
     file_findings = await _review_files(rctx, reviewables=reviewables)
+    total_findings = sum(len(ff.findings) for ff in file_findings)
+    logger.info(
+        "v3: pass 3 done — %d potential findings across %d files",
+        total_findings,
+        len(file_findings),
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # PASS 4: Verify — agentic ctx.sample() + tool-based collection
@@ -449,16 +480,20 @@ async def production_review(
     # confirm_finding() or dismiss_finding() tools. Only confirmed
     # findings survive. No complex structured output needed.
 
+    logger.info("v3: pass 4 verify — %d findings to verify", total_findings)
     confirmed_comments = await _verify_findings(rctx, all_findings=file_findings)
+    logger.info("v3: pass 4 done — %d confirmed", len(confirmed_comments))
 
     # Aggregate
-    return _aggregate(
+    result = _aggregate(
         file_findings,
         confirmed_comments,
         total_files,
         files_prefiltered + files_filtered,
         min_confidence,
     )
+    logger.info("v3: done — %s, %d comments", result.verdict, len(result.comments))
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -763,6 +798,7 @@ async def _verify_batch(
         Call this when your investigation confirms the issue exists.
         Provide the evidence you found and an updated confidence score.
         """
+        logger.info("v3: CONFIRMED [%s] %s:%s — %s", severity, path, line, title)
         confirmed.append(
             ReviewComment(
                 path=path,
@@ -789,10 +825,8 @@ async def _verify_batch(
         Call this when your investigation shows the issue doesn't exist,
         is handled elsewhere, or is inconclusive.
         """
-        return (
-            f"Dismissed '{title}'. Reason: {reason}. "
-            f"Move on to the next unprocessed finding."
-        )
+        logger.info("v3: DISMISSED %s — %s", title, reason[:80])
+        return f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
 
     # --- Build prompt with all findings across files ---
     all_findings_text = []

@@ -363,8 +363,8 @@ wheels = [
 
 [[package]]
 name = "fastmcp"
-version = "2.1.3.dev3054+ac8970e9"
-source = { git = "https://github.com/strawgate/fastmcp.git?rev=strawgate%2Fcombined-sampling-fixes#ac8970e923bdf62a426d79b8959b50b303eb7664" }
+version = "2.1.3.dev3055+c3236261"
+source = { git = "https://github.com/strawgate/fastmcp.git?rev=strawgate%2Fcombined-sampling-fixes#c32362615e91ce6911a21d71c778efdbc35e2671" }
 dependencies = [
     { name = "authlib" },
     { name = "cyclopts" },

@@ -10,10 +10,14 @@ PRReviewResult with verdict, comments, and scores -- all validated
 against the Pydantic schema automatically by FastMCP.
 """
 
+import logging
+
 from fastmcp import Context
 
 from fastmcp_pr_review.github_client import GitHubPRClient
 from fastmcp_pr_review.models import PRReviewResult
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Prompt -- inlined so you can read the full example in one file
@@ -82,6 +86,8 @@ async def simple_review(
     2. Call ctx.sample() with result_type=PRReviewResult
     3. FastMCP ensures the response matches the Pydantic schema
     """
+    logger.info("v1: reviewing %s#%d", repo, pr_number)
+
     # Fetch PR data
     timeline = await gh.get_timeline(repo, pr_number)
 
@@ -105,6 +111,13 @@ async def simple_review(
     if focus_areas:
         user_prompt += f"\n\nFocus especially on: {focus_areas}"
 
+    n_files = len([f for f in timeline.files if f.patch])
+    logger.info(
+        "v1: sampling — %d files, %d chars prompt",
+        n_files,
+        len(user_prompt),
+    )
+
     # -----------------------------------------------------------------------
     # THE INTERESTING PART: one ctx.sample() call with structured output
     # -----------------------------------------------------------------------
@@ -121,4 +134,10 @@ async def simple_review(
         max_tokens=16384,
     )
 
-    return result.result
+    review = result.result
+    logger.info(
+        "v1: done — %s, %d comments",
+        review.verdict,
+        len(review.comments),
+    )
+    return review
