@@ -10,10 +10,12 @@ PRReviewResult with verdict, comments, and scores -- all validated
 against the Pydantic schema automatically by FastMCP.
 """
 
+import asyncio
 import logging
 
 from fastmcp import Context
 
+from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.github_client import GitHubPRClient
 from fastmcp_pr_review.models import PRReviewResult
 
@@ -88,22 +90,36 @@ async def simple_review(
     """
     logger.info("v1: reviewing %s#%d", repo, pr_number)
 
-    # Fetch PR data
+    # Fetch PR data + project context in parallel
     timeline = await gh.get_timeline(repo, pr_number)
-
-    # Build the prompt -- just markdown with the diff inlined
     pr = timeline.pr
+
+    project_context, linked_issues = await asyncio.gather(
+        gather_project_context(gh, repo, pr.head_sha),
+        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+    )
+
+    # Build the prompt
     patches = "\n\n".join(
         f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```" for f in timeline.files if f.patch
     )
     diff_context = patches or "(no patches available)"
+
+    # Inject project context and linked issues into the prompt
+    context_section = ""
+    if project_context:
+        context_section = f"\n### Project Context\n{project_context}\n"
+    if linked_issues:
+        issues_text = "\n\n".join(linked_issues)
+        context_section += f"\n### Linked Issues\n{issues_text}\n"
 
     user_prompt = (
         f"## Pull Request: {pr.title} (#{pr.number})\n"
         f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
         f"Stats: +{pr.additions} -{pr.deletions} "
         f"across {pr.changed_files} files\n\n"
-        f"### Description\n{pr.body or '(no description)'}\n\n"
+        f"### Description\n{pr.body or '(no description)'}\n"
+        f"{context_section}\n"
         f"### Diff\n{diff_context}\n\n"
         "Review this PR and provide your structured assessment."
     )

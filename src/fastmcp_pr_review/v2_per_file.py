@@ -16,12 +16,14 @@ This is what you'd build after spending a couple days iterating on v1:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import Counter
 
 from fastmcp import Context  # noqa: TC002
 from pydantic import BaseModel, Field
 
+from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.github_client import GitHubPRClient  # noqa: TC001
 from fastmcp_pr_review.models import (
     CommentCategory,
@@ -184,6 +186,12 @@ async def per_file_review(
     timeline = await gh.get_timeline(repo, pr_number)
     pr = timeline.pr
 
+    # Gather project context + linked issues in parallel
+    project_context, linked_issues = await asyncio.gather(
+        gather_project_context(gh, repo, pr.head_sha),
+        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+    )
+
     # Skip files with no patch (binary files, renames without content)
     reviewable = [f for f in timeline.files if f.patch]
     batches = _make_batches(reviewable)
@@ -241,13 +249,29 @@ async def per_file_review(
                 f"</file_diff>"
             )
 
+        project_section = ""
+        if project_context:
+            project_section = f"\n<project_context>\n{project_context}\n</project_context>\n"
+        issues_section = ""
+        if linked_issues:
+            issues_text = "\n\n".join(linked_issues)
+            issues_section = (
+                f"\n<linked_issues>\n"
+                f"Review against these requirements:\n"
+                f"{issues_text}\n"
+                f"</linked_issues>\n"
+            )
+
         user_prompt = (
             f"<context>\n"
             f"PR #{pr.number}: {pr.title}\n"
             f"Author: @{pr.author.login} | "
             f"{pr.head_ref} -> {pr.base_ref}\n"
             f"Description: {pr.body or '(none)'}\n"
-            f"</context>\n\n" + "\n\n".join(file_sections) + "\n\nReview each file above."
+            f"</context>\n"
+            f"{project_section}{issues_section}\n"
+            + "\n\n".join(file_sections)
+            + "\n\nReview each file above."
         )
 
         if focus_areas:

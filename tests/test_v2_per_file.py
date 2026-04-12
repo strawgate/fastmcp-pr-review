@@ -74,6 +74,19 @@ def _make_file_review(filename: str = "src/main.py") -> FileReview:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_context(monkeypatch):
+    """Skip project context gathering in all tests."""
+    monkeypatch.setattr(
+        "fastmcp_pr_review.v2_per_file.gather_project_context",
+        AsyncMock(return_value=""),
+    )
+    monkeypatch.setattr(
+        "fastmcp_pr_review.v2_per_file.extract_linked_issues",
+        AsyncMock(return_value=[]),
+    )
+
+
 class TestMakeBatches:
     def test_small_files_grouped(self) -> None:
         files = [
@@ -137,9 +150,7 @@ class TestPerFileReview:
     async def test_reviews_files(self) -> None:
         ctx = MagicMock()
         ctx.sample = AsyncMock(
-            return_value=MagicMock(
-                result=BatchReview(files=[_make_file_review()])
-            )
+            return_value=MagicMock(result=BatchReview(files=[_make_file_review()]))
         )
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
@@ -175,9 +186,7 @@ class TestPerFileReview:
         ]
         ctx = MagicMock()
         ctx.sample = AsyncMock(
-            return_value=MagicMock(
-                result=BatchReview(files=[_make_file_review("a.py")])
-            )
+            return_value=MagicMock(result=BatchReview(files=[_make_file_review("a.py")]))
         )
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline(files))
@@ -191,9 +200,7 @@ class TestPerFileReview:
     async def test_includes_focus_areas(self) -> None:
         ctx = MagicMock()
         ctx.sample = AsyncMock(
-            return_value=MagicMock(
-                result=BatchReview(files=[_make_file_review()])
-            )
+            return_value=MagicMock(result=BatchReview(files=[_make_file_review()]))
         )
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())

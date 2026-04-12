@@ -54,6 +54,19 @@ def _make_result() -> PRReviewResult:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_context(monkeypatch):
+    """Skip project context gathering in all tests."""
+    monkeypatch.setattr(
+        "fastmcp_pr_review.v1_simple.gather_project_context",
+        AsyncMock(return_value=""),
+    )
+    monkeypatch.setattr(
+        "fastmcp_pr_review.v1_simple.extract_linked_issues",
+        AsyncMock(return_value=[]),
+    )
+
+
 class TestSimpleReview:
     @pytest.mark.asyncio
     async def test_single_sample_call_no_tools(self) -> None:

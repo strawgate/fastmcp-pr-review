@@ -23,13 +23,13 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import logging
-import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.models import (
     CommentCategory,
     PRReviewResult,
@@ -374,130 +374,6 @@ than confirming it and wasting the author's time.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Pass 0: Project context + linked issues
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Well-known files to read for project context, in priority order.
-# We read whichever exist and concatenate (truncated) into a context string.
-_PROJECT_DOC_PATHS = [
-    "README.md",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "CONTRIBUTING.md",
-    "CODE_STYLE.md",
-    ".coderabbit.yaml",
-    ".github/copilot-instructions.md",
-]
-
-_MAX_DOC_CHARS = 2000  # per file — enough for key info, not overwhelming
-_MAX_PROJECT_CONTEXT = 8000  # total cap across all docs
-
-
-async def _gather_project_context(
-    gh: GitHubPRClient,
-    repo: str,
-    ref: str,
-) -> str:
-    """Read well-known project docs to understand the codebase.
-
-    Tries each path in _PROJECT_DOC_PATHS. Files that don't exist are
-    silently skipped. Each file is truncated to _MAX_DOC_CHARS.
-    """
-    docs: list[str] = []
-    total = 0
-
-    # Fetch all in parallel
-    results = await asyncio.gather(
-        *(gh.get_file_contents(repo, path, ref) for path in _PROJECT_DOC_PATHS),
-        return_exceptions=True,
-    )
-
-    for path, result in zip(_PROJECT_DOC_PATHS, results, strict=True):
-        if isinstance(result, Exception):
-            continue
-        content = str(result)
-        if not content or content.startswith("(unable to read"):
-            continue
-
-        # Truncate long docs
-        if len(content) > _MAX_DOC_CHARS:
-            content = content[:_MAX_DOC_CHARS] + "\n... (truncated)"
-
-        if total + len(content) > _MAX_PROJECT_CONTEXT:
-            break
-
-        docs.append(f"### {path}\n{content}")
-        total += len(content)
-        logger.debug("v3: read project doc %s (%d chars)", path, len(content))
-
-    if docs:
-        logger.info("v3: pass 0 — read %d project docs (%d chars)", len(docs), total)
-    else:
-        logger.info("v3: pass 0 — no project docs found")
-
-    return "\n\n".join(docs)
-
-
-_ISSUE_REF_PATTERN = re.compile(
-    r"(?:"
-    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"  # "fixes #123"
-    r")?#(\d+)",
-    re.IGNORECASE,
-)
-
-
-async def _extract_linked_issues(
-    gh: GitHubPRClient,
-    repo: str,
-    pr_body: str | None,
-    branch_name: str,
-) -> list[str]:
-    """Extract and fetch linked GitHub issues from PR body and branch name.
-
-    Parses patterns like #123, fixes #456, closes #789 from the PR body.
-    Also checks the branch name for issue numbers (e.g. fix/issue-123).
-    """
-    refs: set[int] = set()
-
-    # Parse from PR body
-    if pr_body:
-        for match in _ISSUE_REF_PATTERN.finditer(pr_body):
-            refs.add(int(match.group(1)))
-
-    # Parse from branch name (e.g. "fix/123", "issue-456", "feat/gh-789")
-    for m in re.finditer(r"(\d+)", branch_name):
-        num = int(m.group(1))
-        if 1 < num < 100000:  # reasonable issue number range
-            refs.add(num)
-
-    if not refs:
-        return []
-
-    # Fetch issue details in parallel
-    async def fetch_issue(num: int) -> str | None:
-        try:
-            owner, repo_name = repo.split("/")
-            resp = await gh._github.rest.issues.async_get(owner, repo_name, num)
-            issue = resp.parsed_data
-            body = (issue.body or "")[:500]
-            return f"**#{num}: {issue.title}** ({issue.state})\n{body}"
-        except Exception:
-            return None
-
-    results = await asyncio.gather(*(fetch_issue(n) for n in sorted(refs)))
-    issues = [r for r in results if r is not None]
-
-    if issues:
-        logger.info(
-            "v3: pass 0 — found %d linked issues: %s",
-            len(issues),
-            sorted(refs),
-        )
-
-    return issues
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -544,8 +420,8 @@ async def production_review(
         comments_by_file,
         prior_reviews,
     ) = await asyncio.gather(
-        _gather_project_context(gh, repo, pr.head_sha),
-        _extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+        gather_project_context(gh, repo, pr.head_sha),
+        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
         gh.get_review_comments_by_file(repo, pr_number),
         gh.get_prior_review_bodies(repo, pr_number),
     )
