@@ -16,14 +16,12 @@ This is what you'd build after spending a couple days iterating on v1:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import Counter
 
 from fastmcp import Context  # noqa: TC002
 from pydantic import BaseModel, Field
 
-from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.github_client import GitHubPRClient  # noqa: TC001
 from fastmcp_pr_review.models import (
     CommentCategory,
@@ -174,6 +172,8 @@ async def per_file_review(
     *,
     focus_areas: str | None = None,
     min_confidence: int = 50,
+    project_context: str = "",
+    linked_issues: list[str] | None = None,
 ) -> PRReviewResult:
     """Review a PR in batches, giving the LLM tools to explore the repo.
 
@@ -185,12 +185,6 @@ async def per_file_review(
 
     timeline = await gh.get_timeline(repo, pr_number)
     pr = timeline.pr
-
-    # Gather project context + linked issues in parallel
-    project_context, linked_issues = await asyncio.gather(
-        gather_project_context(gh, repo, pr.head_sha),
-        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
-    )
 
     # Skip files with no patch (binary files, renames without content)
     reviewable = [f for f in timeline.files if f.patch]

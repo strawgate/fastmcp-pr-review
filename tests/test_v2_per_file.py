@@ -74,19 +74,6 @@ def _make_file_review(filename: str = "src/main.py") -> FileReview:
     )
 
 
-@pytest.fixture(autouse=True)
-def _no_context(monkeypatch):
-    """Skip project context gathering in all tests."""
-    monkeypatch.setattr(
-        "fastmcp_pr_review.v2_per_file.gather_project_context",
-        AsyncMock(return_value=""),
-    )
-    monkeypatch.setattr(
-        "fastmcp_pr_review.v2_per_file.extract_linked_issues",
-        AsyncMock(return_value=[]),
-    )
-
-
 class TestMakeBatches:
     def test_small_files_grouped(self) -> None:
         files = [

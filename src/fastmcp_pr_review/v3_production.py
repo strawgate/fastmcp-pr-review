@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.models import (
     CommentCategory,
     PRReviewResult,
@@ -390,38 +389,29 @@ async def production_review(
     filter_batch_size: int = 10,
     concurrency: int = 3,
     min_confidence: int = 50,
+    project_context: str = "",
+    linked_issues: list[str] | None = None,
 ) -> PRReviewResult:
-    """Production PR review: Context -> Filter -> Review -> Verify.
+    """Production PR review: Filter -> Review -> Verify.
 
-    Pass 0: Read project docs (README, AGENTS.md, etc.) + linked issues
     Pass 1: Gather PR context (timeline, prior reviews, existing threads)
     Pass 2: Batch-filter files by interest level
     Pass 3: Deep per-file review with tools + verification protocol
     Pass 4: Agentic verification of findings with repo exploration
+
+    Args:
+        project_context: Pre-fetched project docs (README, AGENTS.md, etc.)
+        linked_issues: Pre-fetched linked issue summaries
     """
 
     logger.info("v3: reviewing %s#%d (intensity=%s)", repo, pr_number, intensity)
 
     # ═══════════════════════════════════════════════════════════════════
-    # PASS 0 + 1: Project context + PR context (all in parallel)
+    # PASS 1: PR context (timeline, threads, prior reviews)
     # ═══════════════════════════════════════════════════════════════════
-    # Fetch project docs, PR timeline, threads, prior reviews, and
-    # linked issues all concurrently. Pass 0 (project docs + issues)
-    # runs alongside Pass 1 (PR-specific data) for zero extra latency.
 
-    # We need the timeline first to get head_sha and PR body,
-    # so we do a two-phase gather: timeline first, then everything else.
-    timeline = await gh.get_timeline(repo, pr_number)
-    pr = timeline.pr
-
-    (
-        project_context,
-        linked_issues,
-        comments_by_file,
-        prior_reviews,
-    ) = await asyncio.gather(
-        gather_project_context(gh, repo, pr.head_sha),
-        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+    timeline, comments_by_file, prior_reviews = await asyncio.gather(
+        gh.get_timeline(repo, pr_number),
         gh.get_review_comments_by_file(repo, pr_number),
         gh.get_prior_review_bodies(repo, pr_number),
     )
@@ -434,7 +424,7 @@ async def production_review(
         sum(len(v) for v in comments_by_file.values()),
         len(prior_reviews),
         len(project_context),
-        len(linked_issues),
+        len(linked_issues or []),
     )
 
     # Pre-filter: skip binary/generated files (no LLM needed)
@@ -481,7 +471,7 @@ async def production_review(
         intensity=intensity,
         concurrency=concurrency,
         project_context=project_context,
-        linked_issues=linked_issues,
+        linked_issues=linked_issues or [],
     )
 
     logger.info("v3: pass 3 review — %d files (concurrency=%d)", len(reviewables), concurrency)

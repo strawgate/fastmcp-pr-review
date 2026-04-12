@@ -10,12 +10,10 @@ PRReviewResult with verdict, comments, and scores -- all validated
 against the Pydantic schema automatically by FastMCP.
 """
 
-import asyncio
 import logging
 
 from fastmcp import Context
 
-from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.github_client import GitHubPRClient
 from fastmcp_pr_review.models import PRReviewResult
 
@@ -80,6 +78,8 @@ async def simple_review(
     pr_number: int,
     *,
     focus_areas: str | None = None,
+    project_context: str = "",
+    linked_issues: list[str] | None = None,
 ) -> PRReviewResult:
     """Review a PR with a single LLM call. No tools, just structured output.
 
@@ -87,17 +87,15 @@ async def simple_review(
     1. Build a prompt with the full diff
     2. Call ctx.sample() with result_type=PRReviewResult
     3. FastMCP ensures the response matches the Pydantic schema
+
+    Args:
+        project_context: Pre-fetched project docs (README, AGENTS.md, etc.)
+        linked_issues: Pre-fetched linked issue summaries
     """
     logger.info("v1: reviewing %s#%d", repo, pr_number)
 
-    # Fetch PR data + project context in parallel
     timeline = await gh.get_timeline(repo, pr_number)
     pr = timeline.pr
-
-    project_context, linked_issues = await asyncio.gather(
-        gather_project_context(gh, repo, pr.head_sha),
-        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
-    )
 
     # Build the prompt
     patches = "\n\n".join(

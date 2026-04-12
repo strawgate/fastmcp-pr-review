@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from fastmcp import Context, FastMCP
 
+from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
 from fastmcp_pr_review.github_client import GitHubPRClient
 from fastmcp_pr_review.models import (
     PRFile,
@@ -122,6 +123,20 @@ def create_server(
         """
         return await gh.get_files(repo, pr_number)
 
+    # ── Shared context gathering ────────────────────────────────────────
+
+    async def _gather_context(repo: str, pr_number: int) -> tuple[str, list[str]]:
+        """Fetch project docs + linked issues for any review tool."""
+        import asyncio
+
+        timeline = await gh.get_timeline(repo, pr_number)
+        pr = timeline.pr
+        project_ctx, issues = await asyncio.gather(
+            gather_project_context(gh, repo, pr.head_sha),
+            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+        )
+        return project_ctx, issues
+
     # ── v1: Simple (one sample call, structured output, no tools) ────────
 
     @mcp.tool
@@ -144,7 +159,16 @@ def create_server(
         assert ctx is not None
         from fastmcp_pr_review.v1_simple import simple_review
 
-        return await simple_review(gh, ctx, repo, pr_number, focus_areas=focus_areas)
+        project_ctx, issues = await _gather_context(repo, pr_number)
+        return await simple_review(
+            gh,
+            ctx,
+            repo,
+            pr_number,
+            focus_areas=focus_areas,
+            project_context=project_ctx,
+            linked_issues=issues,
+        )
 
     # ── v2: Per-file review with tools ──────────────────────────────────
 
@@ -169,7 +193,16 @@ def create_server(
         assert ctx is not None
         from fastmcp_pr_review.v2_per_file import per_file_review
 
-        return await per_file_review(gh, ctx, repo, pr_number, focus_areas=focus_areas)
+        project_ctx, issues = await _gather_context(repo, pr_number)
+        return await per_file_review(
+            gh,
+            ctx,
+            repo,
+            pr_number,
+            focus_areas=focus_areas,
+            project_context=project_ctx,
+            linked_issues=issues,
+        )
 
     # ── v3: Production pipeline ──────────────────────────────────────────
 
@@ -197,11 +230,14 @@ def create_server(
         assert ctx is not None
         from fastmcp_pr_review.v3_production import production_review
 
+        project_ctx, issues = await _gather_context(repo, pr_number)
         return await production_review(
             gh,
             ctx,
             repo,
             pr_number,
+            project_context=project_ctx,
+            linked_issues=issues,
             focus_areas=focus_areas,
             intensity=intensity,
         )

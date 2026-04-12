@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+# Note: tests call simple_review() directly with project_context=""
+# and linked_issues=[] as defaults — no mocking needed.
 from fastmcp_pr_review.models import (
     PRAuthor,
     PRDetails,
@@ -51,19 +53,6 @@ def _make_result() -> PRReviewResult:
         summary="Looks good",
         risk_score=1,
         health_score=100,
-    )
-
-
-@pytest.fixture(autouse=True)
-def _no_context(monkeypatch):
-    """Skip project context gathering in all tests."""
-    monkeypatch.setattr(
-        "fastmcp_pr_review.v1_simple.gather_project_context",
-        AsyncMock(return_value=""),
-    )
-    monkeypatch.setattr(
-        "fastmcp_pr_review.v1_simple.extract_linked_issues",
-        AsyncMock(return_value=[]),
     )
 
 
