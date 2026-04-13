@@ -21,3 +21,7 @@ wheels/
 
 # Claude Code
 .claude/
+.claude.json
+
+# Logfire
+.logfire/

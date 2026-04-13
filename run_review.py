@@ -6,6 +6,11 @@ import os
 import sys
 import time
 
+import logfire
+
+logfire.configure()
+logfire.instrument_mcp()
+
 # Enable debug logging for token usage and pipeline
 logging.basicConfig(
     level=logging.WARNING,

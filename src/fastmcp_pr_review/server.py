@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+import logfire
 from fastmcp import Context, FastMCP
 
 from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
@@ -70,6 +71,9 @@ def create_server(
     sampling_handler: SamplingHandler | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP PR review server."""
+    logfire.configure()
+    logfire.instrument_mcp()
+
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
     if not token:
         msg = "GITHUB_TOKEN must be set via argument or environment variable"
