@@ -10,6 +10,7 @@ import logfire
 
 logfire.configure(inspect_arguments=False)
 logfire.instrument_mcp()
+logfire.instrument_google_genai()
 
 # Enable debug logging for token usage and pipeline
 logging.basicConfig(

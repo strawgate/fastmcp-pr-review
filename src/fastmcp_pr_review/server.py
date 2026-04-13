@@ -73,6 +73,7 @@ def create_server(
     """Create and configure the FastMCP PR review server."""
     logfire.configure()
     logfire.instrument_mcp()
+    logfire.instrument_google_genai()
 
     token = github_token or os.environ.get("GITHUB_TOKEN", "")
     if not token:
