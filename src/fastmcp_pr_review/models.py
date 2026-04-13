@@ -148,6 +148,7 @@ class CommentCategory(StrEnum):
     ERROR_HANDLING = "error_handling"
     TESTING = "testing"
     MAINTAINABILITY = "maintainability"
+    DOCUMENTATION = "documentation"
 
 
 class ReviewComment(BaseModel):

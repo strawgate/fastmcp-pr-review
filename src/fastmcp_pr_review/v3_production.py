@@ -1,20 +1,18 @@
 """v3: Production PR review pipeline.
 
-A full multi-pass review system demonstrating advanced FastMCP patterns:
+A multi-pass review system demonstrating advanced FastMCP patterns:
 
   Pass 1 — Context: Gather PR metadata, prior reviews, existing threads
-  Pass 2 — Filter: Batch-classify files by interest (structured output)
-  Pass 3 — Review: Per-file deep review with tools + verification protocol
-  Pass 4 — Verify: Agentic exploration to confirm/disprove findings
+  Pass 2 — Filter: Batch-classify files as skip/review (structured output)
+  Pass 3 — Review: Batched review with tool-based finding collection
+  Pass 4 — Verify: Single agentic call to confirm/disprove findings
 
-Production features beyond v2:
+Key patterns beyond v2:
   - Prior review awareness (don't repeat what's already been said)
   - Existing thread dedup (don't re-flag resolved issues)
-  - Batched filtering (50 files classified in 5 parallel sample() calls)
-  - Verification protocol (4-point self-check before each finding)
+  - Tool-based result collection (add_finding/confirm_finding/dismiss_finding)
   - Agentic verification (LLM explores repo to confirm/disprove)
-  - Confidence gating (only high-confidence findings survive)
-  - Configurable intensity (conservative → balanced → aggressive)
+  - Configurable intensity (conservative / balanced / aggressive)
   - Bounded concurrency for parallel stages
 """
 
@@ -60,22 +58,6 @@ SKIP_PATTERNS = [
     "__pycache__/*", "*.pyc", "*.png", "*.jpg", "*.svg", "*.ico",
 ]  # fmt: skip
 
-INTENSITY_GUIDELINES = {
-    "conservative": (
-        "Only flag issues you're highly confident about (confidence >= 80). "
-        "If you can construct a counterargument, do not comment. "
-        "Approval with zero comments is the expected outcome."
-    ),
-    "balanced": (
-        "Flag issues at medium confidence or higher. "
-        "Lean toward not commenting when ambiguous. "
-        "A clean file with no comments is a valid outcome."
-    ),
-    "aggressive": (
-        "Flag everything you notice, including style and improvements. "
-        "Still require evidence — no speculative concerns."
-    ),
-}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -85,10 +67,10 @@ INTENSITY_GUIDELINES = {
 
 @dataclass(frozen=True)
 class _ReviewCtx:
-    """Shared context threaded through review and verify passes.
+    """Shared state passed through the review and verify passes.
 
-    Bundles the parameters that every pass needs so individual functions
-    take 2-3 arguments instead of 10+ positional params.
+    Bundles PR data, GitHub client, sampling context, and review settings
+    so each function takes one `rctx` argument instead of 10+ params.
     """
 
     gh: GitHubPRClient
@@ -123,14 +105,13 @@ class DiffChunk(BaseModel):
 
 
 class FilteredChunk(BaseModel):
-    """Triage result for one file."""
+    """Triage result for one file. Minimal output to save tokens."""
 
     index: int = Field(description="Matches DiffChunk.index")
-    interest: str = Field(description="high, medium, low, or skip")
-    rationale: str
-    focus_hints: list[str] = Field(
-        default_factory=list,
-        description="Specific review focus areas",
+    skip: bool = Field(description="True to skip, false to review")
+    reason: str = Field(
+        default="",
+        description="Why this file was skipped (only when skip=true)",
     )
 
 
@@ -140,11 +121,11 @@ class FilterBatchResult(BaseModel):
     chunks: list[FilteredChunk]
 
 
-# -- Pass 3: Review --
+# -- Pass 3: Review (collected via add_finding tool calls) --
 
 
 class PotentialFinding(BaseModel):
-    """A suspected issue, pre-verification."""
+    """A suspected issue found during review, not yet verified."""
 
     path: str
     line: int | None = Field(default=None)
@@ -164,45 +145,31 @@ class PotentialFinding(BaseModel):
     )
 
 
-class FileFindings(BaseModel):
-    """result_type for per-file review — structured output + tools."""
-
-    filename: str
-    findings: list[PotentialFinding] = Field(default_factory=list)
-    file_summary: str = Field(description="1-2 sentence summary")
-
-
-# -- Pass 4: Verify --
-# Instead of asking the LLM to produce a complex nested schema as structured
-# output, the verify pass uses TOOL CALLS to collect results. The LLM calls
-# confirm_finding() or dismiss_finding() as it explores, and the confirmed
-# findings accumulate in a list via closure. The result_type is trivial.
+# -- Pass 4: Verify (collected via confirm_finding/dismiss_finding tool calls) --
 
 
 class VerifyComplete(BaseModel):
-    """Trivial result_type for the verify pass — just signals completion.
-
-    The real results come from confirm_finding/dismiss_finding tool calls
-    that accumulate ReviewComments in a closure during the agentic loop.
+    """Signals the verify pass is done. The real results come from
+    confirm_finding/dismiss_finding tool calls during the agentic loop.
     """
 
     summary: str = Field(description="Brief summary of verification results")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Shared tool factory — used by both Pass 3 (Review) and Pass 4 (Verify)
+# Exploration tools — shared by review and verify passes
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _make_tools(
+def _make_exploration_tools(
     gh: GitHubPRClient,
     timeline: PRTimeline,
     repo: str,
 ) -> list[Callable[..., object]]:
-    """Build the three exploration tools used by review and verify passes.
+    """Build exploration tools shared by the review and verify passes.
 
-    Returns a consistent set of tool closures so both passes expose
-    identical capabilities with identical names.
+    These let the LLM read files, check diffs, and list changed files
+    during its tool-calling loop.
     """
     pr = timeline.pr
     all_files = timeline.files
@@ -234,142 +201,131 @@ def _make_tools(
 # Prompts
 # ═══════════════════════════════════════════════════════════════════════════
 
-FILTER_SYSTEM_PROMPT = """\
-<task>
-You are a senior engineer triaging pull request diffs. For each file,
-classify how interesting it is for code review. Be a quality gate.
-</task>
+# -- Layer 1: System prompt (cached across ALL calls, all modes, all PRs) --
 
-<classification>
-- high: Logic changes, new features, security-relevant, API changes.
-- medium: Configs with consequences, tests that could mask bugs, refactors.
-- low: Renaming, formatting, comment updates, dep bumps.
-- skip: Generated code, pure dead-code deletion, no review value.
-</classification>
+SYSTEM_PROMPT = """\
+You are an expert code reviewer. You think like a senior engineer doing a \
+real code review: you read the diff, understand the intent, trace data flow, \
+and only speak up when something is genuinely wrong.
 
-<focus_hints>
-For high/medium files, provide 1-3 *specific* focus hints like:
-- "Check that the new retry logic handles timeout correctly"
-- "Verify SQL parameterization in the new query builder"
-Do NOT write generic hints like "review carefully".</focus_hints>"""
+Your north star: would a senior engineer on this team agree this is worth \
+commenting on? If not, stay silent. Silence is the default. Zero findings \
+is the most common and best outcome.
 
+== Severity (assign AFTER investigating, not before) ==
+  critical: Must fix before merge — security vuln, data corruption, prod outage
+  high: Should fix before merge — logic error, missing validation, perf regression
+  medium: Non-blocking, address soon — error handling gap, suboptimal pattern
+  low: Author's discretion — minor improvement, documentation
+  nitpick: Truly optional — stylistic preference, alternative approach
 
-REVIEW_SYSTEM_PROMPT = """\
-<task>
-You are an expert code reviewer. Analyze this file's diff and produce
-structured findings. Be concise, specific, and actionable.
-Finding no issues is a valid and valuable outcome.
-</task>
+== What NOT to flag ==
+These are the most common false positives. Do not flag ANY of these:
+- Input already sanitized: by framework, parameterized query, upstream validation
+- Null safety: guarded by type system, assertion, schema validation, or upstream check
+- Error handling: delegated to caller, middleware, framework boundary, or error type
+- Performance: N is small in practice, or concern is theoretical without evidence
+- Missing tests: for trivial code, auto-generated code, or simple delegation
+- Missing validation: handled at another layer (API gateway, schema, middleware)
+- Style/naming: unless it violates the project's own documented guidelines
+- Anything where you cannot construct a concrete failure scenario with specific input
 
-<constraints>
-- ONLY comment on code in the diff (added or modified lines)
-- Do NOT re-flag issues that have existing review threads
-- Every finding MUST include a concrete failure scenario
-- Describe what verification would confirm or disprove each finding
-- Check completeness: if the PR fixes a pattern across files, verify all instances
-- Use tools to check related files for consistency with the change
-</constraints>
-
-<severity_classification>
-Determine severity AFTER investigating the issue, not before. First
-identify the problem and trace through the code, then assign severity.
-- critical: Must fix before merge. Security vulns, data corruption, prod-breaking.
-- high: Should fix before merge. Logic errors, missing validation, perf regression.
-- medium: Address soon, non-blocking. Error handling gaps, suboptimal patterns.
-- low: Author discretion, non-blocking. Minor improvements, documentation.
-- nitpick: Truly optional. Stylistic preferences, alternative approaches.
-</severity_classification>
-
-<false_positives>
-Do NOT flag:
-- Input sanitized upstream, by framework, or via parameterized queries
-- Null/undefined guarded by type system, assertion, schema validation, or upstream check
-- Error handling delegated to caller, middleware, or framework error boundary
-- Performance concerns where N is demonstrably small in context
-- Missing validation handled at another layer (API gateway, schema, middleware)
-- Missing tests for trivial getters/setters, auto-generated code, or simple delegation
-- Style/naming unless it violates the project's documented coding guidelines
-- Any issue where you cannot describe a concrete failure scenario
-</false_positives>
-
-<verification_protocol>
-Before including each finding, verify:
-1. What specific code pattern or change triggers this concern?
-2. Read surrounding context -- is it handled elsewhere in the file, caller, or framework?
-3. Construct a concrete failure scenario. What input or state causes the bug? If you cannot, STOP.
-4. Challenge your finding -- would a senior engineer agree this is real? If unsure, STOP.
-</verification_protocol>
-
-<calibration_examples>
-Use these to calibrate your judgment. Each pair shows a real issue and a
-similar-looking pattern that is NOT an issue.
+== Calibration examples ==
+These pairs train your threshold. The first is a real issue. The second looks \
+similar but is NOT an issue — learn why.
 
 Null access:
-  FLAG: `user = await db.find(id); res.json(user.name)` -- find() can return
-  null, accessing .name throws. No upstream guard.
-  SKIP: `settings = user.getSettings()` -- user is typed non-null and
-  guaranteed by auth middleware.
+  FLAG: `user = await db.find(id); return user.name` — find() returns nullable, \
+  .name throws on null. No upstream guard, no type narrowing.
+  SKIP: `settings = user.getSettings()` — user is typed non-null, guaranteed by \
+  auth middleware. The type system prevents this from being null.
 
 SQL injection:
-  FLAG: `cursor.execute(f"SELECT * WHERE id = '{user_id}'")` -- string
-  interpolation with user input, no parameterization.
-  SKIP: `cursor.execute(f"SELECT * WHERE status = '{Status.ACTIVE.value}'")`
-  -- interpolated value is a hardcoded enum, not user input.
+  FLAG: `cursor.execute(f"SELECT * WHERE id = '{user_id}'")` — user_id comes \
+  from request params, string interpolation bypasses parameterization.
+  SKIP: `cursor.execute(f"SELECT * WHERE status = '{Status.ACTIVE.value}'")` — \
+  interpolated value is a hardcoded enum member, not user input.
+
+Missing error handling:
+  FLAG: `data = json.loads(response.text); return data["key"]` — response could \
+  be non-JSON (HTML error page), json.loads throws, no try/except.
+  SKIP: `data = await client.get_json("/api/data")` — client.get_json() handles \
+  parsing and raises a typed error, caller catches at the boundary.
+
+Race condition:
+  FLAG: `if not cache.has(key): cache.set(key, compute())` — TOCTOU between \
+  has() and set(), concurrent requests duplicate expensive compute().
+  SKIP: `cache.get_or_set(key, compute)` — atomic operation, framework handles it.
 
 Performance:
-  SKIP: Nested loop over items and tags -- without evidence that N is large
-  in practice, this is speculative. Do not flag theoretical concerns.
-</calibration_examples>
+  SKIP: Nested loop over items and tags — without evidence that N is large in \
+  practice, this is speculative. Do not flag theoretical perf concerns.
 
-<rigor>
-Silence is better than noise. A false positive wastes the author's time
-and erodes trust in every future review. Only report findings you could
-defend in code review. Avoid hedging language like "might," "could," or
-"possibly." If you are not confident, do not include the finding.
-Finding no issues is better than findings that waste time.
-</rigor>"""
+== Rigor ==
+Silence is better than noise. A false positive wastes the author's time and \
+erodes trust in every future review. Never hedge — no "might", "could", \
+"possibly". If you aren't confident after investigation, do not include it. \
+Finding zero issues is better than findings that waste time.
+
+== Tool use ==
+Call MULTIPLE tools in a single turn. Batch 3-5 tool calls per turn. \
+When done, include final_response in the same turn as your last tool call."""
 
 
-EXPLORE_SYSTEM_PROMPT = """\
-<task>
-You are verifying suspected code review findings. Use the available tools
-to explore the repository and confirm or disprove each finding.
-</task>
+# -- Layer 2: Static per-mode instructions (cached per mode across all PRs) --
 
-<protocol>
-For each finding:
-1. Read its verification_needs to understand what to check.
-2. Use exploration tools to gather evidence:
-   - get_file_contents(path) to read source files
-   - lookup_file_diff(path) to see other files' diffs
-   - list_changed_files() to see all changed files
-3. Based on evidence, call ONE of:
-   - confirm_finding(...) if the issue is real
-   - dismiss_finding(...) if the issue is not real or inconclusive
-4. Move on to the next finding.
-</protocol>
+FILTER_INSTRUCTIONS = """\
+MODE: FILTER — Triage files for code review.
 
-<guidelines>
-- Be thorough but efficient. Start with what verification_needs suggests.
-- Do NOT invent new findings — only verify what was already found.
-- Every finding MUST be either confirmed or dismissed EXACTLY ONCE.
-  Do not call confirm_finding or dismiss_finding more than once per finding.
-- When confirming, provide an updated confidence score based on evidence.
-- You can call multiple tools per turn (5-10 is fine). For example, read
-  several files at once, or confirm/dismiss multiple findings in one turn.
-</guidelines>
+For each file, decide: skip or review. Set skip=true ONLY for files with \
+zero code review value:
+- Pure formatting/whitespace changes with no logic change
+- Auto-generated files (lock files, snapshots, compiled output, .min.js)
+- Pure deletions of dead/unused code with no replacement logic
+- Dependency version bumps with no accompanying code changes
 
-<dismiss_criteria>
-DISMISS a finding if ANY of these apply:
-- The issue is a style preference, not a bug or security concern
-- The concern is handled elsewhere (caller, framework, middleware, types)
-- You cannot construct a concrete failure scenario with specific input/state
-- A senior engineer would close this as "not a real issue"
-- The finding uses hedging language ("might," "could," "possibly") because
-  even after investigation you are not confident it is real
-Silence is better than noise. Dismissing a weak finding is always better
-than confirming it and wasting the author's time.
-</dismiss_criteria>"""
+Everything else gets reviewed. Most files should NOT be skipped. \
+Output minimal JSON — keep skip reasons under 10 words."""
+
+
+REVIEW_INSTRUCTIONS = """\
+MODE: REVIEW — Find real bugs in pull request diffs.
+
+Call add_finding(filename, ...) for each real issue you find. Use exploration \
+tools (get_file_contents, lookup_file_diff, list_changed_files) to verify \
+your concerns before flagging them.
+
+Verification protocol — complete ALL steps before calling add_finding:
+1. What specific code pattern or change triggers this concern?
+2. Is it handled elsewhere? Read the caller, check for middleware, look at types.
+3. Construct a concrete failure scenario with specific input/state. If you cannot: STOP.
+4. Would a senior engineer on this team agree this is worth flagging? If unsure: STOP.
+
+No findings is valid and expected for most batches. Do not re-flag issues from \
+existing review threads. Do not repeat points from prior reviews.
+
+Intensity levels (the message will specify which):
+  conservative: only flag confidence >= 80, zero comments is the expected outcome
+  balanced: flag medium+ confidence, lean toward silence when ambiguous
+  aggressive: flag everything noticed, still require evidence for each"""
+
+
+VERIFY_INSTRUCTIONS = """\
+MODE: VERIFY — Confirm or disprove suspected code review findings.
+
+You will receive a list of findings from the review pass. For each one:
+1. Read the verification_needs field to understand what to check
+2. Use get_file_contents() to read the relevant source code
+3. Trace the data flow, check callers, look for guards and handlers
+4. Call confirm_finding() if the issue is real, dismiss_finding() if not
+
+Rules:
+- Every finding MUST be confirmed or dismissed EXACTLY ONCE
+- Do NOT invent new findings — only verify what was found
+- DISMISS if: style preference, handled elsewhere (caller/framework/middleware/types), \
+  no concrete failure scenario constructible, or inconclusive after investigation
+- When confirming, provide evidence and an updated confidence score
+- Dismissing a weak finding is always better than confirming it"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -392,16 +348,13 @@ async def production_review(
     project_context: str = "",
     linked_issues: list[str] | None = None,
 ) -> PRReviewResult:
-    """Production PR review: Filter -> Review -> Verify.
+    """Production PR review pipeline: Context -> Filter -> Review -> Verify.
 
-    Pass 1: Gather PR context (timeline, prior reviews, existing threads)
-    Pass 2: Batch-filter files by interest level
-    Pass 3: Deep per-file review with tools + verification protocol
-    Pass 4: Agentic verification of findings with repo exploration
-
-    Args:
-        project_context: Pre-fetched project docs (README, AGENTS.md, etc.)
-        linked_issues: Pre-fetched linked issue summaries
+    Four passes:
+      1. Context — fetch PR timeline, prior reviews, existing threads
+      2. Filter — batch-classify files as skip/review (cheap, no tools)
+      3. Review — batched review with add_finding() tool calls
+      4. Verify — single agentic call to confirm/disprove findings
     """
 
     logger.info("v3: reviewing %s#%d (intensity=%s)", repo, pr_number, intensity)
@@ -432,33 +385,21 @@ async def production_review(
     files_prefiltered = total_files - len(chunks)
 
     # ═══════════════════════════════════════════════════════════════════
-    # PASS 2: Filter — batched ctx.sample(), structured output, NO tools
+    # PASS 2: Filter — classify files as skip/review (no tools)
     # ═══════════════════════════════════════════════════════════════════
-    # Classify files in batches of 10. All batches run concurrently.
-    # This is cheap — just classification, not full review.
 
     logger.info("v3: pass 2 filter — %d chunks to classify", len(chunks))
     reviewables = await _filter_files(ctx, chunks, timeline, filter_batch_size)
     files_filtered = len(chunks) - len(reviewables)
-    interest_counts = {}
-    for _, fc in reviewables:
-        interest_counts[fc.interest] = interest_counts.get(fc.interest, 0) + 1
     logger.info(
-        "v3: pass 2 done — %d reviewable (%s), %d filtered",
+        "v3: pass 2 done — %d reviewable, %d filtered",
         len(reviewables),
-        interest_counts,
         files_filtered,
     )
 
     # ═══════════════════════════════════════════════════════════════════
-    # PASS 3: Review — per-file ctx.sample() + tools + verification
+    # PASS 3: Review — batched review with tool-based finding collection
     # ═══════════════════════════════════════════════════════════════════
-    # Each file gets a focused review with:
-    # - The filter stage's focus hints guiding attention
-    # - Existing threads injected to prevent re-flagging
-    # - Prior review context to avoid repeating points
-    # - Tools to explore related files
-    # - A verification protocol the LLM must follow
 
     rctx = _ReviewCtx(
         gh=gh,
@@ -475,30 +416,22 @@ async def production_review(
     )
 
     logger.info("v3: pass 3 review — %d files (concurrency=%d)", len(reviewables), concurrency)
-    file_findings = await _review_files(rctx, reviewables=reviewables)
-    total_findings = sum(len(ff.findings) for ff in file_findings)
-    logger.info(
-        "v3: pass 3 done — %d potential findings across %d files",
-        total_findings,
-        len(file_findings),
-    )
+    all_findings = await _review_files(rctx, chunks=reviewables)
+    logger.info("v3: pass 3 done — %d potential findings", len(all_findings))
 
     # ═══════════════════════════════════════════════════════════════════
-    # PASS 4: Verify — agentic ctx.sample() + tool-based collection
+    # PASS 4: Verify — single agentic call with exploration tools
     # ═══════════════════════════════════════════════════════════════════
-    # For each file with findings, the LLM explores the repo and calls
-    # confirm_finding() or dismiss_finding() tools. Only confirmed
-    # findings survive. No complex structured output needed.
 
-    logger.info("v3: pass 4 verify — %d findings to verify", total_findings)
-    confirmed_comments = await _verify_findings(rctx, all_findings=file_findings)
+    logger.info("v3: pass 4 verify — %d findings to verify", len(all_findings))
+    confirmed_comments = await _verify_findings(rctx, findings=all_findings)
     logger.info("v3: pass 4 done — %d confirmed", len(confirmed_comments))
 
     # Aggregate
     result = _aggregate(
-        file_findings,
         confirmed_comments,
         total_files,
+        len(reviewables),
         files_prefiltered + files_filtered,
         min_confidence,
     )
@@ -512,7 +445,11 @@ async def production_review(
 
 
 def _prefilter(files: list[PRFile], max_files: int) -> list[DiffChunk]:
-    """Drop binary/generated files before wasting LLM calls."""
+    """Drop binary/generated files and convert to DiffChunks for the pipeline.
+
+    Skips files with no patch (binary) or matching SKIP_PATTERNS (generated).
+    Returns at most max_files chunks, sorted largest-first.
+    """
 
     def should_skip(f: PRFile) -> bool:
         if f.patch is None:
@@ -540,8 +477,8 @@ async def _filter_files(
     chunks: list[DiffChunk],
     timeline: PRTimeline,
     batch_size: int,
-) -> list[tuple[DiffChunk, FilteredChunk]]:
-    """Batch-classify files. Returns (chunk, classification) pairs."""
+) -> list[DiffChunk]:
+    """Batch-classify files. Returns chunks that should be reviewed."""
     if not chunks:
         return []
 
@@ -560,248 +497,263 @@ async def _filter_files(
                 f"```diff\n{preview}\n```\n</chunk>"
             )
 
-        prompt = (
-            f"<context>\nPR #{pr.number}: {pr.title}\n"
-            f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
-            f"Description: {pr.body or '(none)'}\n</context>\n\n"
-            f"Classify these {len(batch)} files:\n\n" + "\n\n".join(chunk_texts)
+        data = (
+            f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
+            f"{pr.head_ref} -> {pr.base_ref}\n"
+            f"Classify {len(batch)} files:\n\n"
+            + "\n\n".join(chunk_texts)
         )
 
         r = await ctx.sample(
-            messages=prompt,
-            system_prompt=FILTER_SYSTEM_PROMPT,
+            messages=[FILTER_INSTRUCTIONS, data],
+            system_prompt=SYSTEM_PROMPT,
             result_type=FilterBatchResult,
             temperature=0.1,
-            max_tokens=16384,
+            max_tokens=8192,
         )
         return r.result
 
     # All batches run concurrently
     results = await asyncio.gather(*(filter_batch(b) for b in batches))
 
-    # Join back and sort by interest
+    # Keep only chunks not marked for skipping
     chunk_by_idx = {c.index: c for c in chunks}
-    pairs: list[tuple[DiffChunk, FilteredChunk]] = []
+    reviewable: list[DiffChunk] = []
     for br in results:
         for fc in br.chunks:
-            if fc.interest == "skip":
+            if fc.skip:
+                skipped = chunk_by_idx.get(fc.index, fc.index)
+                logger.debug("v3: filter skipped %s — %s", skipped, fc.reason)
                 continue
             chunk = chunk_by_idx.get(fc.index)
             if chunk:
-                pairs.append((chunk, fc))
+                reviewable.append(chunk)
 
-    priority = {"high": 0, "medium": 1, "low": 2}
-    pairs.sort(key=lambda p: priority.get(p[1].interest, 99))
-    return pairs
+    return reviewable
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Pass 3: Review (per-file, tools + verification protocol)
+# Pass 3: Review (batched, tool-based finding collection)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-async def _review_files(
-    rctx: _ReviewCtx,
-    *,
-    reviewables: list[tuple[DiffChunk, FilteredChunk]],
-) -> list[FileFindings]:
-    """Review files with bounded concurrency."""
-    if not reviewables:
-        return []
+class ReviewDone(BaseModel):
+    """Trivial result_type for review — signals the batch is complete.
 
-    sem = asyncio.Semaphore(rctx.concurrency)
-
-    async def review(chunk: DiffChunk, fc: FilteredChunk) -> FileFindings:
-        async with sem:
-            return await _review_one(rctx, chunk=chunk, classification=fc)
-
-    return list(await asyncio.gather(*(review(c, fc) for c, fc in reviewables)))
-
-
-async def _review_one(
-    rctx: _ReviewCtx,
-    *,
-    chunk: DiffChunk,
-    classification: FilteredChunk,
-) -> FileFindings:
-    """Review a single file with full context."""
-    pr = rctx.timeline.pr
-    existing_threads = rctx.existing_threads.get(chunk.filename, [])
-
-    # Format existing threads so LLM knows not to re-flag
-    threads_section = "(none)"
-    if existing_threads:
-        threads_section = "\n".join(
-            f"- @{t.author.login} on line {t.line}: {t.body[:150]}" for t in existing_threads
-        )
-
-    # Format prior review bodies
-    prior_section = "(none)"
-    if rctx.prior_reviews:
-        prior_section = "\n---\n".join(body[:300] for body in rctx.prior_reviews[:3])
-
-    # Format focus hints from filter stage
-    hints_section = ""
-    if classification.focus_hints:
-        hints = "\n".join(f"- {h}" for h in classification.focus_hints)
-        hints_section = (
-            f"\n<focus_hints>\nThe triage pass identified these areas:\n{hints}\n</focus_hints>\n"
-        )
-
-    # Format project context and linked issues
-    project_section = ""
-    if rctx.project_context:
-        project_section = f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
-
-    issues_section = ""
-    if rctx.linked_issues:
-        issues_text = "\n\n".join(rctx.linked_issues)
-        issues_section = (
-            f"\n<linked_issues>\n"
-            f"This PR is related to these issues. "
-            f"Review the code against these requirements:\n"
-            f"{issues_text}\n"
-            f"</linked_issues>\n"
-        )
-
-    prompt = (
-        f"<context>\n"
-        f"PR #{pr.number}: {pr.title}\n"
-        f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
-        f"Triage: {classification.interest} — {classification.rationale}\n"
-        f"</context>\n\n"
-        f"<pr_description>\n{pr.body or '(none)'}\n</pr_description>\n"
-        f"{project_section}"
-        f"{issues_section}"
-        f"{hints_section}\n"
-        f"<file_diff>\n"
-        f"File: {chunk.filename} ({chunk.status})\n"
-        f"```diff\n{chunk.patch}\n```\n"
-        f"</file_diff>\n\n"
-        f"<existing_threads>\n"
-        f"Already flagged on this file. Rules:\n"
-        f"- Resolved with reviewer reply: reviewer's decision is final, do NOT re-flag\n"
-        f"- Resolved without reply: author likely fixed it, do NOT re-raise\n"
-        f"- Unresolved: already flagged, do NOT duplicate\n"
-        f"Threads:\n{threads_section}\n"
-        f"</existing_threads>\n\n"
-        f"<prior_reviews>\n"
-        f"Points already made — do NOT repeat. Only include new observations:\n"
-        f"{prior_section}\n"
-        f"</prior_reviews>\n\n"
-        f"Review this file."
-    )
-    if rctx.focus_areas:
-        prompt += f"\n\nFocus especially on: {rctx.focus_areas}"
-
-    tools = _make_tools(rctx.gh, rctx.timeline, rctx.repo)
-
-    # Add intensity guideline to the user message (not system prompt)
-    # so the system prompt stays identical across all per-file calls
-    guideline = INTENSITY_GUIDELINES.get(rctx.intensity, INTENSITY_GUIDELINES["balanced"])
-    prompt += f"\n\n<signal_noise>\n{guideline}\n</signal_noise>"
-
-    result = await rctx.ctx.sample(
-        messages=prompt,
-        system_prompt=REVIEW_SYSTEM_PROMPT,
-        result_type=FileFindings,
-        tools=tools,
-        temperature=0.2,
-        max_tokens=16384,
-    )
-    return result.result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Pass 4: Verify (agentic exploration)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-MAX_VERIFY_BATCH_FINDINGS = 10
-MAX_VERIFY_BATCH_BYTES = 5000
-
-
-def _batch_findings_for_verify(
-    all_findings: list[FileFindings],
-) -> list[list[FileFindings]]:
-    """Group files with findings into batches for verification.
-
-    Small finding sets get verified together. Files with many or large
-    findings get their own batch. Empty files are dropped.
+    Findings are collected via add_finding() tool calls during the loop.
     """
-    with_findings = [f for f in all_findings if f.findings]
-    if not with_findings:
-        return []
 
-    batches: list[list[FileFindings]] = []
-    current: list[FileFindings] = []
-    current_count = 0
-    current_bytes = 0
+    summary: str = Field(description="Brief summary of review results")
 
-    for ff in with_findings:
-        n = len(ff.findings)
-        size = sum(len(f.body) + len(f.why) for f in ff.findings)
 
-        if size > MAX_VERIFY_BATCH_BYTES or n > MAX_VERIFY_BATCH_FINDINGS:
+# ---------------------------------------------------------------------------
+# Batching — group files by total patch size
+# ---------------------------------------------------------------------------
+
+MAX_BATCH_ITEMS = 10
+MAX_BATCH_BYTES = 10_000
+
+
+def _make_batches(
+    items: list[DiffChunk],
+    *,
+    max_items: int = MAX_BATCH_ITEMS,
+    max_bytes: int = MAX_BATCH_BYTES,
+) -> list[list[DiffChunk]]:
+    """Group files into batches by size for review.
+
+    Small files get batched together. Large files get their own batch.
+    """
+    batches: list[list[DiffChunk]] = []
+    current: list[DiffChunk] = []
+    current_size = 0
+
+    for c in items:
+        patch_size = len(c.patch)
+
+        if patch_size > max_bytes:
             if current:
                 batches.append(current)
-                current, current_count, current_bytes = [], 0, 0
-            batches.append([ff])
+                current, current_size = [], 0
+            batches.append([c])
             continue
 
         if (
-            current_count + n > MAX_VERIFY_BATCH_FINDINGS
-            or current_bytes + size > MAX_VERIFY_BATCH_BYTES
+            current_size + patch_size > max_bytes
+            or len(current) >= max_items
         ):
             batches.append(current)
-            current, current_count, current_bytes = [], 0, 0
+            current, current_size = [], 0
 
-        current.append(ff)
-        current_count += n
-        current_bytes += size
+        current.append(c)
+        current_size += patch_size
 
     if current:
         batches.append(current)
     return batches
 
 
-async def _verify_findings(
+async def _review_files(
     rctx: _ReviewCtx,
     *,
-    all_findings: list[FileFindings],
-) -> list[ReviewComment]:
-    """Verify findings agentically. Returns only confirmed comments.
-
-    Findings from multiple files are batched together for efficiency.
-    The LLM calls confirm_finding() / dismiss_finding() tools as it
-    explores. Confirmed findings accumulate in a list via closure.
-    """
-    batches = _batch_findings_for_verify(all_findings)
-    if not batches:
+    chunks: list[DiffChunk],
+) -> list[PotentialFinding]:
+    """Review files in batches. Returns flat list of findings."""
+    if not chunks:
         return []
+
+    batches = _make_batches(chunks)
+    logger.info("v3: %d files -> %d review batches", len(chunks), len(batches))
 
     sem = asyncio.Semaphore(rctx.concurrency)
 
-    async def verify(batch: list[FileFindings]) -> list[ReviewComment]:
+    async def review(batch: list[DiffChunk]) -> list[PotentialFinding]:
         async with sem:
-            return await _verify_batch(rctx, batch=batch)
+            return await _review_batch(rctx, batch=batch)
 
-    results = await asyncio.gather(*(verify(b) for b in batches))
-    return [c for batch in results for c in batch]
+    results = await asyncio.gather(*(review(b) for b in batches))
+    return [f for batch_results in results for f in batch_results]
 
 
-async def _verify_batch(
+async def _review_batch(
     rctx: _ReviewCtx,
     *,
-    batch: list[FileFindings],
-) -> list[ReviewComment]:
-    """Verify a batch of findings across one or more files.
+    batch: list[DiffChunk],
+) -> list[PotentialFinding]:
+    """Review a batch of files. Findings collected via add_finding() tool calls."""
+    pr = rctx.timeline.pr
 
-    The LLM calls confirm_finding() or dismiss_finding() for each
-    suspected issue. Exploration tools let it read files, check
-    callers, and look at imports. Confirmed findings are collected
-    via closure — no complex structured output needed.
+    # Build per-file diff sections with existing threads
+    file_sections = []
+    for chunk in batch:
+        existing = rctx.existing_threads.get(chunk.filename, [])
+        threads_text = "(none)"
+        if existing:
+            threads_text = "\n".join(
+                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}"
+                for t in existing
+            )
+        file_sections.append(
+            f"<file_diff>\n"
+            f"File: {chunk.filename} ({chunk.status}, "
+            f"+{chunk.additions} -{chunk.deletions})\n"
+            f"```diff\n{chunk.patch}\n```\n"
+            f"Existing threads: {threads_text}\n"
+            f"</file_diff>"
+        )
+
+    # Format prior review bodies (shared across batch)
+    prior_section = "(none)"
+    if rctx.prior_reviews:
+        prior_section = "\n---\n".join(body[:300] for body in rctx.prior_reviews[:3])
+
+    # Format project context and linked issues
+    project_section = ""
+    if rctx.project_context:
+        project_section = (
+            f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
+        )
+
+    issues_section = ""
+    if rctx.linked_issues:
+        issues_text = "\n\n".join(rctx.linked_issues)
+        issues_section = (
+            f"\n<linked_issues>\n"
+            f"Review against these requirements:\n"
+            f"{issues_text}\n"
+            f"</linked_issues>\n"
+        )
+
+    data = f"Intensity: {rctx.intensity}\n"
+    data += (
+        f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
+        f"{pr.head_ref} -> {pr.base_ref}\n"
+    )
+    if pr.body:
+        data += f"Description: {pr.body}\n"
+    if rctx.focus_areas:
+        data += f"Focus: {rctx.focus_areas}\n"
+    data += f"{project_section}{issues_section}\n"
+    data += "\n\n".join(file_sections)
+    if prior_section != "(none)":
+        data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
+
+    # --- State that accumulates via tool calls ---
+    findings: list[PotentialFinding] = []
+
+    def add_finding(
+        filename: str,
+        title: str,
+        body: str,
+        why: str,
+        verification_needs: str,
+        severity: str = "medium",
+        category: str = "bug",
+        line: int | None = None,
+        end_line: int | None = None,
+        suggested_code: str | None = None,
+        confidence: int = 70,
+    ) -> str:
+        """Report a code review finding.
+
+        Call this for each issue you find. Provide all required fields.
+        Only call this for issues you've verified through the protocol.
+        """
+        findings.append(
+            PotentialFinding(
+                path=filename,
+                line=line,
+                end_line=end_line,
+                severity=Severity(severity),
+                category=CommentCategory(category),
+                title=title,
+                body=body,
+                why=why,
+                suggested_code=suggested_code,
+                confidence=confidence,
+                verification_needs=verification_needs,
+            )
+        )
+        return f"Finding recorded: '{title}'. Continue reviewing or complete."
+
+    exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
+
+    try:
+        await rctx.ctx.sample(
+            messages=[REVIEW_INSTRUCTIONS, data],
+            system_prompt=SYSTEM_PROMPT,
+            result_type=ReviewDone,
+            tools=[add_finding, *exploration_tools],
+            temperature=0.2,
+            max_tokens=8192,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("v3: review batch failed: %s", exc)
+
+    for f in findings:
+        logger.info("v3: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title)
+    return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Pass 4: Verify (single agentic call)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _verify_findings(
+    rctx: _ReviewCtx,
+    *,
+    findings: list[PotentialFinding],
+) -> list[ReviewComment]:
+    """Verify all findings in one agentic ctx.sample() call.
+
+    The LLM gets a compact list (file:line + reason) and exploration
+    tools. It calls confirm_finding() or dismiss_finding() for each.
+    One call, minimal prompt, tools do the heavy lifting.
     """
+    if not findings:
+        return []
+
     pr = rctx.timeline.pr
 
     # --- State that accumulates across the tool loop ---
@@ -856,50 +808,38 @@ async def _verify_batch(
         logger.info("v3: DISMISSED %s — %s", title, reason[:80])
         return f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
 
-    # --- Build prompt with all findings across files ---
-    all_findings_text = []
-    finding_idx = 0
-    for ff in batch:
-        all_findings_text.append(f"### File: {ff.filename}\n{ff.file_summary}")
-        for f in ff.findings:
-            extra = f"\nSuggested fix: {f.suggested_code}" if f.suggested_code else ""
-            all_findings_text.append(
-                f'<finding index="{finding_idx}">\n'
-                f"Title: {f.title}\n"
-                f"Severity: {f.severity} | Category: {f.category}\n"
-                f"Path: {f.path}:{f.line or '?'}\n"
-                f"Body: {f.body}\n"
-                f"Why: {f.why}\n"
-                f"Confidence: {f.confidence}\n"
-                f"Verification needs: {f.verification_needs}"
-                f"{extra}\n"
-                f"</finding>"
-            )
-            finding_idx += 1
+    # --- Build compact finding list ---
+    finding_lines = []
+    for i, f in enumerate(findings):
+        finding_lines.append(
+            f'<finding index="{i}">\n'
+            f"{f.path}:{f.line or '?'} -- {f.title}\n"
+            f"{f.body}\n"
+            f"Verify: {f.verification_needs}\n"
+            f"</finding>"
+        )
 
-    total = finding_idx
-    files = ", ".join(ff.filename for ff in batch)
-    prompt = (
-        f"<context>\n"
+    n = len(findings)
+    data = (
         f"PR #{pr.number}: {pr.title} | @{pr.author.login}\n"
-        f"Files: {files}\n"
-        f"</context>\n\n"
-        f"Verify these {total} findings across {len(batch)} file(s).\n"
-        f"For each, explore the repo then call "
-        f"confirm_finding() or dismiss_finding().\n\n" + "\n\n".join(all_findings_text)
+        f"Verify {n} findings:\n\n"
+        + "\n\n".join(finding_lines)
     )
 
-    exploration_tools = _make_tools(rctx.gh, rctx.timeline, rctx.repo)
+    exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
 
     # --- Agentic sampling with tool-based result collection ---
-    await rctx.ctx.sample(
-        messages=prompt,
-        system_prompt=EXPLORE_SYSTEM_PROMPT,
-        result_type=VerifyComplete,
-        tools=[confirm_finding, dismiss_finding, *exploration_tools],
-        temperature=0.2,
-        max_tokens=16384,
-    )
+    try:
+        await rctx.ctx.sample(
+            messages=[VERIFY_INSTRUCTIONS, data],
+            system_prompt=SYSTEM_PROMPT,
+            result_type=VerifyComplete,
+            tools=[confirm_finding, dismiss_finding, *exploration_tools],
+            temperature=0.2,
+            max_tokens=8192,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("v3: verify failed: %s", exc)
 
     return confirmed
 
@@ -910,9 +850,9 @@ async def _verify_batch(
 
 
 def _aggregate(
-    file_findings: list[FileFindings],
     confirmed_comments: list[ReviewComment],
     total_files: int,
+    files_reviewed: int,
     files_skipped: int,
     min_confidence: int,
 ) -> PRReviewResult:
@@ -924,21 +864,17 @@ def _aggregate(
     n_crit, n_high = sev.get("critical", 0), sev.get("high", 0)
     risk, health = compute_scores(dict(sev))
 
-    summaries = [
-        f"- **{ff.filename}**: {ff.file_summary}" for ff in file_findings if ff.file_summary
-    ]
-
     return PRReviewResult(
         verdict=compute_verdict(n_crit, n_high, sev.get("medium", 0)),
         summary=(
-            f"Reviewed {len(file_findings)} files, verified findings "
+            f"Reviewed {files_reviewed} of {total_files} files "
             f"({len(comments)} confirmed, "
-            f"{n_crit} critical, {n_high} high).\n" + "\n".join(summaries)
+            f"{n_crit} critical, {n_high} high)."
         ),
         comments=comments,
         risk_score=risk,
         health_score=health,
-        files_reviewed=len(file_findings),
+        files_reviewed=files_reviewed,
         files_skipped=files_skipped,
         stats=ReviewStats(
             total_comments=len(comments),

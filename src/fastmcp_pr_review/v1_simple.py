@@ -67,7 +67,7 @@ Finding no issues is a valid outcome -- do not invent problems."""
 
 
 # ---------------------------------------------------------------------------
-# The review function -- this is the whole thing
+# Review function
 # ---------------------------------------------------------------------------
 
 

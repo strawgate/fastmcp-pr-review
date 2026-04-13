@@ -109,7 +109,7 @@ class TestSeverity:
 class TestCommentCategory:
     def test_all_categories(self) -> None:
         assert CommentCategory.BUG == "bug"
-        assert len(CommentCategory) == 8
+        assert len(CommentCategory) == 9
 
 
 class TestReviewComment:
