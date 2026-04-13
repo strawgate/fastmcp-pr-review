@@ -25,6 +25,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import logfire
 from pydantic import BaseModel, Field
 
 from fastmcp_pr_review.models import (
@@ -357,27 +358,53 @@ async def production_review(
       4. Verify — single agentic call to confirm/disprove findings
     """
 
-    logger.info("v3: reviewing %s#%d (intensity=%s)", repo, pr_number, intensity)
+    with logfire.span(
+        "production_review {repo}#{pr_number}",
+        repo=repo,
+        pr_number=pr_number,
+        intensity=intensity,
+    ):
+        return await _production_review_inner(
+            gh, ctx, repo, pr_number,
+            focus_areas=focus_areas,
+            intensity=intensity,
+            max_files=max_files,
+            filter_batch_size=filter_batch_size,
+            concurrency=concurrency,
+            min_confidence=min_confidence,
+            project_context=project_context,
+            linked_issues=linked_issues,
+        )
 
-    # ═══════════════════════════════════════════════════════════════════
-    # PASS 1: PR context (timeline, threads, prior reviews)
-    # ═══════════════════════════════════════════════════════════════════
 
-    timeline, comments_by_file, prior_reviews = await asyncio.gather(
-        gh.get_timeline(repo, pr_number),
-        gh.get_review_comments_by_file(repo, pr_number),
-        gh.get_prior_review_bodies(repo, pr_number),
-    )
+async def _production_review_inner(
+    gh: GitHubPRClient,
+    ctx: Context,
+    repo: str,
+    pr_number: int,
+    *,
+    focus_areas: str | None,
+    intensity: str,
+    max_files: int,
+    filter_batch_size: int,
+    concurrency: int,
+    min_confidence: int,
+    project_context: str,
+    linked_issues: list[str] | None,
+) -> PRReviewResult:
+    with logfire.span("pass 1: context"):
+        timeline, comments_by_file, prior_reviews = await asyncio.gather(
+            gh.get_timeline(repo, pr_number),
+            gh.get_review_comments_by_file(repo, pr_number),
+            gh.get_prior_review_bodies(repo, pr_number),
+        )
 
     total_files = len(timeline.files)
-    logger.info(
-        "v3: context — %d files, %d threads, %d prior reviews, "
-        "%d chars project docs, %d linked issues",
-        total_files,
-        sum(len(v) for v in comments_by_file.values()),
-        len(prior_reviews),
-        len(project_context),
-        len(linked_issues or []),
+    logfire.info(
+        "context: {files} files, {threads} threads, {reviews} prior reviews",
+        files=total_files,
+        threads=sum(len(v) for v in comments_by_file.values()),
+        reviews=len(prior_reviews),
     )
 
     # Pre-filter: skip binary/generated files (no LLM needed)
@@ -388,14 +415,14 @@ async def production_review(
     # PASS 2: Filter — classify files as skip/review (no tools)
     # ═══════════════════════════════════════════════════════════════════
 
-    logger.info("v3: pass 2 filter — %d chunks to classify", len(chunks))
-    reviewables = await _filter_files(ctx, chunks, timeline, filter_batch_size)
-    files_filtered = len(chunks) - len(reviewables)
-    logger.info(
-        "v3: pass 2 done — %d reviewable, %d filtered",
-        len(reviewables),
-        files_filtered,
-    )
+    with logfire.span("pass 2: filter", files=len(chunks)):
+        reviewables = await _filter_files(ctx, chunks, timeline, filter_batch_size)
+        files_filtered = len(chunks) - len(reviewables)
+        logfire.info(
+            "filter done: {reviewable} reviewable, {filtered} filtered",
+            reviewable=len(reviewables),
+            filtered=files_filtered,
+        )
 
     # ═══════════════════════════════════════════════════════════════════
     # PASS 3: Review — batched review with tool-based finding collection
@@ -415,17 +442,17 @@ async def production_review(
         linked_issues=linked_issues or [],
     )
 
-    logger.info("v3: pass 3 review — %d files (concurrency=%d)", len(reviewables), concurrency)
-    all_findings = await _review_files(rctx, chunks=reviewables)
-    logger.info("v3: pass 3 done — %d potential findings", len(all_findings))
+    with logfire.span("pass 3: review", files=len(reviewables), concurrency=concurrency):
+        all_findings = await _review_files(rctx, chunks=reviewables)
+        logfire.info("{n} potential findings", n=len(all_findings))
 
     # ═══════════════════════════════════════════════════════════════════
     # PASS 4: Verify — single agentic call with exploration tools
     # ═══════════════════════════════════════════════════════════════════
 
-    logger.info("v3: pass 4 verify — %d findings to verify", len(all_findings))
-    confirmed_comments = await _verify_findings(rctx, findings=all_findings)
-    logger.info("v3: pass 4 done — %d confirmed", len(confirmed_comments))
+    with logfire.span("pass 4: verify", findings=len(all_findings)):
+        confirmed_comments = await _verify_findings(rctx, findings=all_findings)
+        logfire.info("{n} confirmed", n=len(confirmed_comments))
 
     # Aggregate
     result = _aggregate(
