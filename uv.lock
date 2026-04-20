@@ -404,6 +404,7 @@ name = "fastmcp-pr-review"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "fastmcp" },
     { name = "githubkit", extra = ["auth-app"] },
     { name = "google-genai" },
@@ -423,6 +424,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click", specifier = ">=8.1" },
     { name = "fastmcp", git = "https://github.com/strawgate/fastmcp.git?rev=strawgate%2Fcombined-sampling-fixes-v2" },
     { name = "githubkit", extras = ["auth-app"], specifier = ">=0.12.0" },
     { name = "google-genai", specifier = ">=1.0.0" },

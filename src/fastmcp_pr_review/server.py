@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+import click
 import logfire
 from fastmcp import Context, FastMCP
 
@@ -20,6 +21,8 @@ from fastmcp_pr_review.models import (
 
 if TYPE_CHECKING:
     from fastmcp.client.sampling import SamplingHandler
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
 def _format_timeline_event(event: TimelineEvent) -> str:
@@ -67,7 +70,7 @@ def _make_gemini_handler(model: str) -> SamplingHandler:
 def create_server(
     *,
     github_token: str | None = None,
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
     sampling_handler: SamplingHandler | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP PR review server."""
@@ -250,13 +253,33 @@ def create_server(
     return mcp
 
 
-def main() -> None:
-    """Entry point for the MCP server."""
+def _load_env_file() -> None:
     from dotenv import load_dotenv
 
     load_dotenv()
-    server = create_server()
+
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--github-token",
+    help="Override GITHUB_TOKEN for this server process.",
+)
+@click.option(
+    "--gemini-model",
+    default=DEFAULT_GEMINI_MODEL,
+    show_default=True,
+    help="Fallback Gemini model when the MCP client cannot provide sampling.",
+)
+def cli(github_token: str | None, gemini_model: str) -> None:
+    """Run the FastMCP PR review MCP server."""
+    _load_env_file()
+    server = create_server(github_token=github_token, gemini_model=gemini_model)
     server.run()
+
+
+def main() -> None:
+    """Entry point for the MCP server."""
+    cli.main(standalone_mode=False)
 
 
 if __name__ == "__main__":

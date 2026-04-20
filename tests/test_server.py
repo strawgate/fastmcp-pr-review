@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import os
-import sys
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from click.testing import CliRunner
 from fastmcp import Client
 
 from fastmcp_pr_review.models import (
@@ -22,6 +21,7 @@ from fastmcp_pr_review.models import (
 from fastmcp_pr_review.server import (
     _format_timeline,
     _format_timeline_event,
+    cli,
     create_server,
 )
 
@@ -77,20 +77,36 @@ class TestCreateServer:
         server = create_server(github_token="fake", sampling_handler=MagicMock())
         assert server is not None
 
-    def test_main_loads_dotenv_and_runs(self) -> None:
+    def test_cli_loads_dotenv_and_runs(self) -> None:
         from fastmcp_pr_review import server as server_module
 
-        load_dotenv = MagicMock()
         mock_server = MagicMock()
+        runner = CliRunner()
 
         with (
-            patch.dict(sys.modules, {"dotenv": SimpleNamespace(load_dotenv=load_dotenv)}),
-            patch.object(server_module, "create_server", return_value=mock_server),
+            patch.object(server_module, "_load_env_file") as load_env_file,
+            patch.object(server_module, "create_server", return_value=mock_server) as create_server,
         ):
+            result = runner.invoke(
+                cli,
+                ["--github-token", "cli-token", "--gemini-model", "gemini-2.5-pro"],
+            )
+
+        assert result.exit_code == 0
+        load_env_file.assert_called_once_with()
+        create_server.assert_called_once_with(
+            github_token="cli-token",
+            gemini_model="gemini-2.5-pro",
+        )
+        mock_server.run.assert_called_once_with()
+
+    def test_main_dispatches_to_click(self) -> None:
+        from fastmcp_pr_review import server as server_module
+
+        with patch.object(server_module.cli, "main") as cli_main:
             server_module.main()
 
-        load_dotenv.assert_called_once_with()
-        mock_server.run.assert_called_once_with()
+        cli_main.assert_called_once_with(standalone_mode=False)
 
 
 class TestToolRegistration:

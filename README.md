@@ -32,6 +32,8 @@ cp .env.example .env
 # edit .env with your GitHub and Gemini credentials
 
 uv run fastmcp-pr-review
+# or override runtime settings explicitly
+uv run fastmcp-pr-review --gemini-model gemini-2.5-pro
 ```
 
 The server auto-loads `.env` when started from the repo directory.
@@ -52,7 +54,9 @@ Add the server to your Claude MCP config with a stdio entry that runs this repo 
         "--directory",
         "/absolute/path/to/fastmcp-pr-review",
         "run",
-        "fastmcp-pr-review"
+        "fastmcp-pr-review",
+        "--gemini-model",
+        "gemini-2.5-pro"
       ],
       "env": {}
     }
@@ -61,6 +65,7 @@ Add the server to your Claude MCP config with a stdio entry that runs this repo 
 ```
 
 Keep `GITHUB_TOKEN` and `GEMINI_API_KEY` in `/absolute/path/to/fastmcp-pr-review/.env` so Claude does not need inline secrets in its MCP config.
+Use CLI flags for non-secret runtime settings like the fallback Gemini model.
 
 ## Development
 
