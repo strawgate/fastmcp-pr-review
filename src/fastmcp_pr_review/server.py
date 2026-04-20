@@ -252,6 +252,9 @@ def create_server(
 
 def main() -> None:
     """Entry point for the MCP server."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
     server = create_server()
     server.run()
 

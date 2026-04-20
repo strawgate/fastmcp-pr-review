@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -74,6 +76,21 @@ class TestCreateServer:
     def test_creates_with_token(self) -> None:
         server = create_server(github_token="fake", sampling_handler=MagicMock())
         assert server is not None
+
+    def test_main_loads_dotenv_and_runs(self) -> None:
+        from fastmcp_pr_review import server as server_module
+
+        load_dotenv = MagicMock()
+        mock_server = MagicMock()
+
+        with (
+            patch.dict(sys.modules, {"dotenv": SimpleNamespace(load_dotenv=load_dotenv)}),
+            patch.object(server_module, "create_server", return_value=mock_server),
+        ):
+            server_module.main()
+
+        load_dotenv.assert_called_once_with()
+        mock_server.run.assert_called_once_with()
 
 
 class TestToolRegistration:

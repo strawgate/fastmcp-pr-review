@@ -28,14 +28,39 @@ Four-pass pipeline with batched file filtering, per-file review with a verificat
 
 ```bash
 uv sync
-
-export GITHUB_TOKEN="ghp_..."
-export GEMINI_API_KEY="AIza..."
+cp .env.example .env
+# edit .env with your GitHub and Gemini credentials
 
 uv run fastmcp-pr-review
 ```
 
+The server auto-loads `.env` when started from the repo directory.
+
 The server also exposes data tools: `get_pr_info`, `get_pr_diff`, `get_pr_files`.
+
+## Add to Claude
+
+Add the server to your Claude MCP config with a stdio entry that runs this repo through `uv`:
+
+```json
+{
+  "mcpServers": {
+    "fastmcp-pr-review": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/absolute/path/to/fastmcp-pr-review",
+        "run",
+        "fastmcp-pr-review"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+Keep `GITHUB_TOKEN` and `GEMINI_API_KEY` in `/absolute/path/to/fastmcp-pr-review/.env` so Claude does not need inline secrets in its MCP config.
 
 ## Development
 
