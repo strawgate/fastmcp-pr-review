@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 PROJECT_DOC_PATHS = [
     "README.md",
     "AGENTS.md",
-    "CLAUDE.md",
     "CONTRIBUTING.md",
     "CODE_STYLE.md",
     ".coderabbit.yaml",

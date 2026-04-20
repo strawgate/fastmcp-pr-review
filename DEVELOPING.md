@@ -32,6 +32,7 @@ uv run ruff check src/ tests/     # Lint
 uv run ruff format src/ tests/    # Format
 uv run ty check                   # Type check
 uv run fastmcp-pr-review          # Run the server
+uv run python scripts/run_review.py owner/repo 123 v1  # Dev smoke test
 ```
 
 ## How Sampling Works

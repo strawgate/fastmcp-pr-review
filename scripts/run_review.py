@@ -77,7 +77,9 @@ async def main() -> None:
     print(f"\n{'='*60}")
     print(f"RESULT ({elapsed:.1f}s)")
     print(f"{'='*60}")
-    print(f"Verdict: {result.get('verdict', '?')}")
+    print(
+        f"Verdict: {result.get('verdict', '?')}"
+    )
     print(f"Risk: {result.get('risk_score', '?')}/10 | "
           f"Health: {result.get('health_score', '?')}/100")
     print(f"Files reviewed: {result.get('files_reviewed', '?')} | "
