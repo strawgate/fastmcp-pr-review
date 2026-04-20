@@ -25,6 +25,13 @@ Each mode file defines its own stage-specific Pydantic models **inline** so the 
 
 ```bash
 uv sync                           # Install dependencies
+make format                       # Ruff format
+make lint                         # Ruff check
+make lint-fix                     # Ruff check --fix
+make typecheck                    # Type check
+make test                         # Run tests
+make server-stdio                 # Run stdio server
+make server-http                  # Run HTTP server at http://127.0.0.1:8000/mcp/
 uv run pytest tests/ -v           # Run tests
 uv run ruff check src/ tests/     # Lint
 uv run ruff format src/ tests/    # Format

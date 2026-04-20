@@ -107,7 +107,46 @@ class TestCreateServer:
             github_token="cli-token",
             gemini_model="gemini-2.5-pro",
         )
-        mock_server.run.assert_called_once_with()
+        mock_server.run.assert_called_once_with(transport="stdio")
+
+    def test_cli_runs_http_transport(self) -> None:
+        from fastmcp_pr_review import server as server_module
+
+        mock_server = MagicMock()
+        runner = CliRunner()
+
+        with (
+            patch.object(server_module, "_load_env_file"),
+            patch.object(server_module, "_apply_runtime_env"),
+            patch.object(server_module, "create_server", return_value=mock_server) as create_server,
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "--github-token",
+                    "cli-token",
+                    "--transport",
+                    "http",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "9000",
+                    "--path",
+                    "/api/mcp/",
+                ],
+            )
+
+        assert result.exit_code == 0
+        create_server.assert_called_once_with(
+            github_token="cli-token",
+            gemini_model="gemini-2.5-flash",
+        )
+        mock_server.run.assert_called_once_with(
+            transport="http",
+            host="0.0.0.0",
+            port=9000,
+            path="/api/mcp/",
+        )
 
     def test_cli_reads_hosted_env_vars(self) -> None:
         from fastmcp_pr_review import server as server_module
@@ -135,7 +174,7 @@ class TestCreateServer:
             github_token="horizon-github-token",
             gemini_model="gemini-2.5-flash",
         )
-        mock_server.run.assert_called_once_with()
+        mock_server.run.assert_called_once_with(transport="stdio")
 
     def test_main_dispatches_to_click(self) -> None:
         from fastmcp_pr_review import server as server_module

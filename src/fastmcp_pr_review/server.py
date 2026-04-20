@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from fastmcp.client.sampling import SamplingHandler
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PATH = "/mcp/"
 
 
 def _format_timeline_event(event: TimelineEvent) -> str:
@@ -248,12 +251,50 @@ def _apply_runtime_env(*, gemini_api_key: str | None) -> None:
     show_default=True,
     help="Fallback Gemini model when the MCP client cannot provide sampling.",
 )
-def cli(github_token: str | None, gemini_api_key: str | None, gemini_model: str) -> None:
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"], case_sensitive=False),
+    default="stdio",
+    show_default=True,
+    help="Server transport to run.",
+)
+@click.option(
+    "--host",
+    default=DEFAULT_HTTP_HOST,
+    show_default=True,
+    help="Host to bind when running with HTTP transport.",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_HTTP_PORT,
+    show_default=True,
+    type=int,
+    help="Port to bind when running with HTTP transport.",
+)
+@click.option(
+    "--path",
+    "http_path",
+    default=DEFAULT_HTTP_PATH,
+    show_default=True,
+    help="HTTP MCP path when running with HTTP transport.",
+)
+def cli(
+    github_token: str | None,
+    gemini_api_key: str | None,
+    gemini_model: str,
+    transport: str,
+    host: str,
+    port: int,
+    http_path: str,
+) -> None:
     """Run the FastMCP PR review MCP server."""
     _load_env_file()
     _apply_runtime_env(gemini_api_key=gemini_api_key)
     server = create_server(github_token=github_token, gemini_model=gemini_model)
-    server.run()
+    if transport == "http":
+        server.run(transport="http", host=host, port=port, path=http_path)
+        return
+    server.run(transport="stdio")
 
 
 def main() -> None:

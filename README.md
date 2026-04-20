@@ -29,6 +29,8 @@ cp .env.example .env
 uv run fastmcp-pr-review
 # or override runtime settings explicitly
 uv run fastmcp-pr-review --gemini-model gemini-2.5-pro
+make server-stdio
+make server-http HOST=0.0.0.0 PORT=8000
 ```
 
 The server auto-loads `.env` when started from the repo directory, and the Click launcher also reads `GITHUB_TOKEN` and `GEMINI_API_KEY` directly from the process environment. That means hosted environments like Horizon can inject those vars without extra CLI flags.
@@ -71,6 +73,21 @@ Add the server to your Claude MCP config with a stdio entry that runs this repo 
 
 Keep `GITHUB_TOKEN` and `GEMINI_API_KEY` in `/absolute/path/to/fastmcp-pr-review/.env` or inject them via the host environment so Claude does not need inline secrets in its MCP config.
 Use CLI flags for non-secret runtime settings like the fallback Gemini model.
+
+## Makefile
+
+The repo includes a Makefile for the common local workflows:
+
+```bash
+make server-stdio
+make server-http HOST=0.0.0.0 PORT=8000
+make format
+make lint
+make lint-fix
+make typecheck
+make test
+make build
+```
 
 ## Development
 
