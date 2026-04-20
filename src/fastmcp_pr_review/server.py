@@ -1,4 +1,4 @@
-"""FastMCP server exposing three PR review tools of increasing depth."""
+"""FastMCP server exposing fast and thorough PR review modes."""
 
 from __future__ import annotations
 
@@ -89,10 +89,9 @@ def create_server(
     mcp = FastMCP(
         name="pr-review",
         instructions=(
-            "GitHub PR review server with three tools of increasing depth:\n"
-            "- review_pr_simple: Quick single-shot review (one LLM call)\n"
-            "- review_pr: Per-file review with tools (LLM explores the repo)\n"
-            "- review_pr_deep: Production pipeline (filter + review + verify)"
+            "GitHub PR review server with two review modes:\n"
+            "- review_pr_fast: Quick single-shot review (one LLM call)\n"
+            "- review_pr_thorough: Multi-pass pipeline (filter + review + verify)"
         ),
         sampling_handler=handler,
         sampling_handler_behavior="fallback",
@@ -145,16 +144,16 @@ def create_server(
         )
         return project_ctx, issues
 
-    # ── v1: Simple (one sample call, structured output, no tools) ────────
+    # ── Fast mode: one sample call, structured output, no tools ──────────
 
     @mcp.tool
-    async def review_pr_simple(
+    async def review_pr_fast(
         repo: str,
         pr_number: int,
         focus_areas: str | None = None,
         ctx: Context | None = None,
     ) -> PRReviewResult:
-        """Fast single-shot PR review using structured output only.
+        """Fast PR review using a single structured sampling call.
 
         One LLM call — sends the full diff and gets back a structured
         review result. No tool calling. Best for small PRs or quick checks.
@@ -165,10 +164,10 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
         assert ctx is not None
-        from fastmcp_pr_review.v1_simple import simple_review
+        from fastmcp_pr_review.fast import fast_review
 
         project_ctx, issues = await _gather_context(repo, pr_number)
-        return await simple_review(
+        return await fast_review(
             gh,
             ctx,
             repo,
@@ -178,51 +177,17 @@ def create_server(
             linked_issues=issues,
         )
 
-    # ── v2: Per-file review with tools ──────────────────────────────────
+    # ── Thorough mode: multi-pass pipeline ────────────────────────────────
 
     @mcp.tool
-    async def review_pr(
-        repo: str,
-        pr_number: int,
-        focus_areas: str | None = None,
-        ctx: Context | None = None,
-    ) -> PRReviewResult:
-        """Per-file PR review with tool calling.
-
-        Loops over each changed file and reviews it individually.
-        The LLM can call tools to read other files, look up diffs,
-        and explore the codebase during review.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-            focus_areas: Optional areas to focus on (e.g. 'security')
-        """
-        assert ctx is not None
-        from fastmcp_pr_review.v2_per_file import per_file_review
-
-        project_ctx, issues = await _gather_context(repo, pr_number)
-        return await per_file_review(
-            gh,
-            ctx,
-            repo,
-            pr_number,
-            focus_areas=focus_areas,
-            project_context=project_ctx,
-            linked_issues=issues,
-        )
-
-    # ── v3: Production pipeline ──────────────────────────────────────────
-
-    @mcp.tool
-    async def review_pr_deep(
+    async def review_pr_thorough(
         repo: str,
         pr_number: int,
         focus_areas: str | None = None,
         intensity: str = "balanced",
         ctx: Context | None = None,
     ) -> PRReviewResult:
-        """Production PR review: filter + review + agentic verification.
+        """Thorough PR review: filter + review + agentic verification.
 
         Multi-pass pipeline with prior review awareness, intelligent
         file filtering, per-file review with verification protocol,
@@ -236,10 +201,10 @@ def create_server(
             intensity: Review depth — conservative, balanced, aggressive
         """
         assert ctx is not None
-        from fastmcp_pr_review.v3_production import production_review
+        from fastmcp_pr_review.thorough import thorough_review
 
         project_ctx, issues = await _gather_context(repo, pr_number)
-        return await production_review(
+        return await thorough_review(
             gh,
             ctx,
             repo,

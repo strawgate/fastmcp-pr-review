@@ -18,19 +18,17 @@ logging.basicConfig(
     format="%(levelname)-5s %(name)s: %(message)s",
 )
 for name in [
-    "fastmcp_pr_review.v1_simple",
-    "fastmcp_pr_review.v2_per_file",
-    "fastmcp_pr_review.v3_production",
+    "fastmcp_pr_review.fast",
+    "fastmcp_pr_review.thorough",
     "fastmcp.client.sampling.handlers.google_genai",
     "fastmcp.server.sampling.run",
 ]:
     logging.getLogger(name).setLevel(logging.DEBUG)
 
-# Map CLI version names to MCP tool names
+# Map mode names to MCP tool names
 TOOL_MAP = {
-    "v1": "review_pr_simple",
-    "v2": "review_pr",
-    "v3": "review_pr_deep",
+    "fast": "review_pr_fast",
+    "thorough": "review_pr_thorough",
 }
 
 
@@ -45,15 +43,15 @@ async def main() -> None:
 
     repo = sys.argv[1] if len(sys.argv) > 1 else "strawgate/memagent"
     pr_number = int(sys.argv[2]) if len(sys.argv) > 2 else 1821
-    version = sys.argv[3] if len(sys.argv) > 3 else "v1"
+    mode = sys.argv[3] if len(sys.argv) > 3 else "fast"
 
-    tool_name = TOOL_MAP.get(version)
+    tool_name = TOOL_MAP.get(mode)
     if not tool_name:
-        print(f"Unknown version: {version}. Use v1, v2, or v3.")
+        print(f"Unknown mode: {mode}. Use fast or thorough.")
         return
 
     print(f"\n{'='*60}")
-    print(f"Reviewing {repo}#{pr_number} with {version} ({tool_name})")
+    print(f"Reviewing {repo}#{pr_number} with {mode} ({tool_name})")
     print(f"{'='*60}\n")
 
     # Create the server and connect a client to it in-process
@@ -64,7 +62,7 @@ async def main() -> None:
 
         # Call the tool through MCP — full protocol, real spans
         args = {"repo": repo, "pr_number": pr_number}
-        if version == "v3":
+        if mode == "thorough":
             args["intensity"] = "balanced"
 
         call_result = await client.call_tool(tool_name, args)

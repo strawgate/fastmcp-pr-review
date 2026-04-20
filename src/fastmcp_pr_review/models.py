@@ -1,9 +1,8 @@
 """Shared Pydantic models for PR data, review output, and scoring.
 
-The v1/v2/v3 pipeline modules define their own stage-specific models
-(DiffChunk, FilterBatchResult, FileFindings, ExploreResult, etc.)
-inline so each example is self-contained. This module contains only
-the types shared across all three implementations.
+The fast and thorough review modules define their own stage-specific
+models inline so each mode stays self-contained. This module contains
+only the types shared across both modes.
 """
 
 from __future__ import annotations

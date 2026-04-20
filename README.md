@@ -1,26 +1,21 @@
 # FastMCP PR Review
 
-A GitHub PR review server built with [FastMCP](https://github.com/jlowin/fastmcp), demonstrating three levels of structured sampling with LLMs.
+A GitHub PR review server built with [FastMCP](https://github.com/jlowin/fastmcp), with two review modes: **fast** and **thorough**.
 
-Each implementation is **self-contained** — read any single file top-to-bottom to understand the complete pattern.
+Each mode is **self-contained** — read either file top-to-bottom to understand the complete pattern.
 
-## The Three Implementations
+## Review Modes
 
 | Tool | File | What it does |
 |------|------|-------------|
-| `review_pr_simple` | `v1_simple.py` | One LLM call, structured output, no tools |
-| `review_pr` | `v2_per_file.py` | Per-file loop with tool calling |
-| `review_pr_deep` | `v3_production.py` | Multi-pass pipeline: filter → review → verify |
+| `review_pr_fast` | `fast.py` | One LLM call, structured output, no tools |
+| `review_pr_thorough` | `thorough.py` | Multi-pass pipeline: filter → review → verify |
 
-### v1: Simple (111 lines)
+### Fast
 
 One `ctx.sample()` call with `result_type=PRReviewResult`. Sends the full diff, gets back a structured review. Best for small PRs or quick checks.
 
-### v2: Per-File (251 lines)
-
-Loops over each changed file, calling `ctx.sample()` with tools the LLM can use to explore the codebase (read files, look up diffs, list changed files). Good balance of depth and speed.
-
-### v3: Production (783 lines)
+### Thorough
 
 Four-pass pipeline with batched file filtering, per-file review with a verification protocol, and agentic verification where the LLM explores the repo to confirm or disprove findings. Configurable intensity (conservative/balanced/aggressive). Only confirmed findings survive.
 
@@ -39,6 +34,16 @@ uv run fastmcp-pr-review --gemini-model gemini-2.5-pro
 The server auto-loads `.env` when started from the repo directory, and the Click launcher also reads `GITHUB_TOKEN` and `GEMINI_API_KEY` directly from the process environment. That means hosted environments like Horizon can inject those vars without extra CLI flags.
 
 The server also exposes data tools: `get_pr_info`, `get_pr_diff`, `get_pr_files`.
+
+## Deploy to Horizon
+
+For Horizon-style deployments that import a module and look for an `mcp` object, point it at the repo-root `run_horizon_server.py`. That file loads env vars and exposes:
+
+```python
+mcp = create_server()
+```
+
+Set `GITHUB_TOKEN` and `GEMINI_API_KEY` in Horizon, and it can import `run_horizon_server.py` directly.
 
 ## Add to Claude
 

@@ -1,6 +1,6 @@
-"""v1: Simple single-shot PR review.
+"""Fast single-shot PR review.
 
-Demonstrates the simplest FastMCP sampling pattern:
+Demonstrates the leanest FastMCP sampling pattern:
   - One ctx.sample() call
   - Structured output via result_type (Pydantic model)
   - No tool calling
@@ -71,7 +71,7 @@ Finding no issues is a valid outcome -- do not invent problems."""
 # ---------------------------------------------------------------------------
 
 
-async def simple_review(
+async def fast_review(
     gh: GitHubPRClient,
     ctx: Context,
     repo: str,
@@ -92,7 +92,7 @@ async def simple_review(
         project_context: Pre-fetched project docs (README, AGENTS.md, etc.)
         linked_issues: Pre-fetched linked issue summaries
     """
-    logger.info("v1: reviewing %s#%d", repo, pr_number)
+    logger.info("fast: reviewing %s#%d", repo, pr_number)
 
     timeline = await gh.get_timeline(repo, pr_number)
     pr = timeline.pr
@@ -127,7 +127,7 @@ async def simple_review(
 
     n_files = len([f for f in timeline.files if f.patch])
     logger.info(
-        "v1: sampling — %d files, %d chars prompt",
+        "fast: sampling — %d files, %d chars prompt",
         n_files,
         len(user_prompt),
     )
@@ -150,7 +150,7 @@ async def simple_review(
 
     review = result.result
     logger.info(
-        "v1: done — %s, %d comments",
+        "fast: done — %s, %d comments",
         review.verdict,
         len(review.comments),
     )

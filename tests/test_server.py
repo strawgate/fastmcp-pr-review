@@ -158,9 +158,8 @@ class TestToolRegistration:
             assert "get_pr_info" in names
             assert "get_pr_diff" in names
             assert "get_pr_files" in names
-            assert "review_pr_simple" in names
-            assert "review_pr" in names
-            assert "review_pr_deep" in names
+            assert "review_pr_fast" in names
+            assert "review_pr_thorough" in names
 
     @pytest.mark.asyncio
     async def test_get_pr_info(self, server) -> None:
