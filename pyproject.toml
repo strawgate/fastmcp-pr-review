@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1",
-    "fastmcp @ git+https://github.com/strawgate/fastmcp.git@strawgate/combined-sampling-fixes-v2",
+    "fastmcp==3.2.4",
     "githubkit[auth-app]>=0.12.0",
     "google-genai>=1.0.0",
     "logfire[google-genai,mcp]>=4.32.0",
@@ -41,9 +41,6 @@ dev = [
     "ruff>=0.11",
     "ty>=0.0.1a7",
 ]
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [build-system]
 requires = ["hatchling"]

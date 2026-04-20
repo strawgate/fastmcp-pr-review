@@ -106,7 +106,7 @@ mcp = FastMCP(
 
 ## Dependencies
 
-- **fastmcp** — MCP server framework (currently pinned to a fork with sampling handler fixes)
+- **fastmcp** — MCP server framework
 - **githubkit** — Async GitHub API client
 - **google-genai** — Google Gemini SDK (for sampling fallback handler)
 - **pydantic** — Data validation and JSON schema generation
