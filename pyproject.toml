@@ -6,15 +6,29 @@ readme = "README.md"
 authors = [
     { name = "strawgate", email = "williamseaston@gmail.com" },
 ]
+license = { file = "LICENSE" }
 requires-python = ">=3.13"
+keywords = ["mcp", "fastmcp", "github", "pull-request", "code-review", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
-    "fastmcp @ git+https://github.com/strawgate/fastmcp.git@strawgate/combined-sampling-fixes-v2",
+    "click>=8.1",
+    "fastmcp==3.2.4",
     "githubkit[auth-app]>=0.12.0",
     "google-genai>=1.0.0",
     "logfire[google-genai,mcp]>=4.32.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.2.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/strawgate/fastmcp-pr-review"
+Repository = "https://github.com/strawgate/fastmcp-pr-review"
+Documentation = "https://github.com/strawgate/fastmcp-pr-review#readme"
 
 [project.scripts]
 fastmcp-pr-review = "fastmcp_pr_review.server:main"
@@ -28,12 +42,9 @@ dev = [
     "ty>=0.0.1a7",
 ]
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.11.7,<0.12"]
+build-backend = "uv_build"
 
 [tool.ruff]
 target-version = "py313"

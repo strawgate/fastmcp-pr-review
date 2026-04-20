@@ -1,4 +1,4 @@
-"""Tests for v3 production pipeline."""
+"""Tests for the thorough review pipeline."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from fastmcp_pr_review.models import (
     ReviewState,
     Severity,
 )
-from fastmcp_pr_review.v3_production import (
+from fastmcp_pr_review.thorough import (
     FilterBatchResult,
     FilteredChunk,
     PotentialFinding,
@@ -29,7 +29,7 @@ from fastmcp_pr_review.v3_production import (
     _review_files,
     _ReviewCtx,
     _verify_findings,
-    production_review,
+    thorough_review,
 )
 
 
@@ -173,15 +173,21 @@ class TestVerifyFindings:
 class TestAggregate:
     def test_with_confirmed_comments(self) -> None:
         result = _aggregate(
-            [_make_comment()], total_files=1,
-            files_reviewed=1, files_skipped=0, min_confidence=50,
+            [_make_comment()],
+            total_files=1,
+            files_reviewed=1,
+            files_skipped=0,
+            min_confidence=50,
         )
         assert len(result.comments) == 1
 
     def test_empty_comments(self) -> None:
         result = _aggregate(
-            [], total_files=1,
-            files_reviewed=1, files_skipped=0, min_confidence=50,
+            [],
+            total_files=1,
+            files_reviewed=1,
+            files_skipped=0,
+            min_confidence=50,
         )
         assert result.verdict == ReviewState.APPROVED
         assert len(result.comments) == 0
@@ -189,8 +195,11 @@ class TestAggregate:
     def test_confidence_filter(self) -> None:
         low = _make_comment(confidence=30)
         result = _aggregate(
-            [low], total_files=1,
-            files_reviewed=1, files_skipped=0, min_confidence=50,
+            [low],
+            total_files=1,
+            files_reviewed=1,
+            files_skipped=0,
+            min_confidence=50,
         )
         assert len(result.comments) == 0
 
@@ -199,7 +208,7 @@ class TestReviewFiles:
     @pytest.mark.asyncio
     async def test_provides_add_finding_tool(self) -> None:
         """Review pass should provide add_finding + exploration tools."""
-        from fastmcp_pr_review.v3_production import DiffChunk
+        from fastmcp_pr_review.thorough import DiffChunk
 
         rctx = _make_rctx()
         rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
@@ -208,8 +217,12 @@ class TestReviewFiles:
 
         chunks = [
             DiffChunk(
-                index=0, filename="a.py", status="modified",
-                additions=5, deletions=0, patch="+x",
+                index=0,
+                filename="a.py",
+                status="modified",
+                additions=5,
+                deletions=0,
+                patch="+x",
             )
         ]
         results = await _review_files(rctx, chunks=chunks)
@@ -224,7 +237,7 @@ class TestReviewFiles:
     @pytest.mark.asyncio
     async def test_clean_batch_no_findings(self) -> None:
         """A clean batch should return no findings."""
-        from fastmcp_pr_review.v3_production import DiffChunk
+        from fastmcp_pr_review.thorough import DiffChunk
 
         rctx = _make_rctx()
         rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
@@ -233,8 +246,12 @@ class TestReviewFiles:
 
         chunks = [
             DiffChunk(
-                index=0, filename="b.py", status="modified",
-                additions=2, deletions=1, patch="+y",
+                index=0,
+                filename="b.py",
+                status="modified",
+                additions=2,
+                deletions=1,
+                patch="+y",
             )
         ]
         results = await _review_files(rctx, chunks=chunks)
@@ -245,9 +262,7 @@ class TestFullPipeline:
     @pytest.mark.asyncio
     async def test_filter_and_review_passes(self) -> None:
         """filter + review = 2 sample calls when review finds nothing."""
-        filter_result = FilterBatchResult(
-            chunks=[FilteredChunk(index=0, skip=False)]
-        )
+        filter_result = FilterBatchResult(chunks=[FilteredChunk(index=0, skip=False)])
         review_done = ReviewDone(summary="All clean")
 
         ctx = MagicMock()
@@ -264,7 +279,7 @@ class TestFullPipeline:
         gh.get_prior_review_bodies = AsyncMock(return_value=[])
         gh.get_file_contents = AsyncMock(return_value="contents")
 
-        result = await production_review(gh, ctx, "o/r", 1)
+        result = await thorough_review(gh, ctx, "o/r", 1)
 
         # filter (1 batch) + review (1 batch) = 2 calls
         # verify skipped because review found no findings
@@ -289,7 +304,7 @@ class TestFullPipeline:
         gh.get_review_comments_by_file = AsyncMock(return_value={})
         gh.get_prior_review_bodies = AsyncMock(return_value=[])
 
-        result = await production_review(gh, ctx, "o/r", 1)
+        result = await thorough_review(gh, ctx, "o/r", 1)
 
         # Only 1 call: the filter. No review or verify calls needed.
         assert ctx.sample.await_count == 1

@@ -1,4 +1,4 @@
-"""v3: Production PR review pipeline.
+"""Thorough PR review pipeline.
 
 A multi-pass review system demonstrating advanced FastMCP patterns:
 
@@ -7,7 +7,7 @@ A multi-pass review system demonstrating advanced FastMCP patterns:
   Pass 3 — Review: Batched review with tool-based finding collection
   Pass 4 — Verify: Single agentic call to confirm/disprove findings
 
-Key patterns beyond v2:
+Key patterns in thorough mode:
   - Prior review awareness (don't repeat what's already been said)
   - Existing thread dedup (don't re-flag resolved issues)
   - Tool-based result collection (add_finding/confirm_finding/dismiss_finding)
@@ -58,7 +58,6 @@ SKIP_PATTERNS = [
     "vendor/*", "node_modules/*", "dist/*", "build/*",
     "__pycache__/*", "*.pyc", "*.png", "*.jpg", "*.svg", "*.ico",
 ]  # fmt: skip
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -177,12 +176,12 @@ def _make_exploration_tools(
 
     async def get_file_contents(filepath: str) -> str:
         """Read any file in the repo at the PR's head ref."""
-        logger.debug("v3: tool get_file_contents(%s)", filepath)
+        logger.debug("thorough: tool get_file_contents(%s)", filepath)
         return await gh.get_file_contents(repo, filepath, pr.head_sha)
 
     def lookup_file_diff(filename: str) -> str:
         """See another file's diff from this PR."""
-        logger.debug("v3: tool lookup_file_diff(%s)", filename)
+        logger.debug("thorough: tool lookup_file_diff(%s)", filename)
         for f in all_files:
             if f.filename == filename:
                 return f.patch or "(no patch available)"
@@ -190,7 +189,7 @@ def _make_exploration_tools(
 
     def list_changed_files() -> str:
         """List all files changed in this PR."""
-        logger.debug("v3: tool list_changed_files()")
+        logger.debug("thorough: tool list_changed_files()")
         return "\n".join(
             f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in all_files
         )
@@ -334,7 +333,7 @@ Rules:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-async def production_review(
+async def thorough_review(
     gh: GitHubPRClient,
     ctx: Context,
     repo: str,
@@ -349,7 +348,7 @@ async def production_review(
     project_context: str = "",
     linked_issues: list[str] | None = None,
 ) -> PRReviewResult:
-    """Production PR review pipeline: Context -> Filter -> Review -> Verify.
+    """Thorough PR review pipeline: Context -> Filter -> Review -> Verify.
 
     Four passes:
       1. Context — fetch PR timeline, prior reviews, existing threads
@@ -359,13 +358,16 @@ async def production_review(
     """
 
     with logfire.span(
-        "production_review {repo}#{pr_number}",
+        "thorough_review {repo}#{pr_number}",
         repo=repo,
         pr_number=pr_number,
         intensity=intensity,
     ):
-        return await _production_review_inner(
-            gh, ctx, repo, pr_number,
+        return await _thorough_review_inner(
+            gh,
+            ctx,
+            repo,
+            pr_number,
             focus_areas=focus_areas,
             intensity=intensity,
             max_files=max_files,
@@ -377,7 +379,7 @@ async def production_review(
         )
 
 
-async def _production_review_inner(
+async def _thorough_review_inner(
     gh: GitHubPRClient,
     ctx: Context,
     repo: str,
@@ -462,7 +464,7 @@ async def _production_review_inner(
         files_prefiltered + files_filtered,
         min_confidence,
     )
-    logger.info("v3: done — %s, %d comments", result.verdict, len(result.comments))
+    logger.info("thorough: done — %s, %d comments", result.verdict, len(result.comments))
     return result
 
 
@@ -527,8 +529,7 @@ async def _filter_files(
         data = (
             f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
             f"{pr.head_ref} -> {pr.base_ref}\n"
-            f"Classify {len(batch)} files:\n\n"
-            + "\n\n".join(chunk_texts)
+            f"Classify {len(batch)} files:\n\n" + "\n\n".join(chunk_texts)
         )
 
         r = await ctx.sample(
@@ -550,7 +551,7 @@ async def _filter_files(
         for fc in br.chunks:
             if fc.skip:
                 skipped = chunk_by_idx.get(fc.index, fc.index)
-                logger.debug("v3: filter skipped %s — %s", skipped, fc.reason)
+                logger.debug("thorough: filter skipped %s — %s", skipped, fc.reason)
                 continue
             chunk = chunk_by_idx.get(fc.index)
             if chunk:
@@ -605,10 +606,7 @@ def _make_batches(
             batches.append([c])
             continue
 
-        if (
-            current_size + patch_size > max_bytes
-            or len(current) >= max_items
-        ):
+        if current_size + patch_size > max_bytes or len(current) >= max_items:
             batches.append(current)
             current, current_size = [], 0
 
@@ -630,7 +628,7 @@ async def _review_files(
         return []
 
     batches = _make_batches(chunks)
-    logger.info("v3: %d files -> %d review batches", len(chunks), len(batches))
+    logger.info("thorough: %d files -> %d review batches", len(chunks), len(batches))
 
     sem = asyncio.Semaphore(rctx.concurrency)
 
@@ -657,8 +655,7 @@ async def _review_batch(
         threads_text = "(none)"
         if existing:
             threads_text = "\n".join(
-                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}"
-                for t in existing
+                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
             )
         file_sections.append(
             f"<file_diff>\n"
@@ -677,9 +674,7 @@ async def _review_batch(
     # Format project context and linked issues
     project_section = ""
     if rctx.project_context:
-        project_section = (
-            f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
-        )
+        project_section = f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
 
     issues_section = ""
     if rctx.linked_issues:
@@ -692,10 +687,7 @@ async def _review_batch(
         )
 
     data = f"Intensity: {rctx.intensity}\n"
-    data += (
-        f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
-        f"{pr.head_ref} -> {pr.base_ref}\n"
-    )
+    data += f"PR #{pr.number}: {pr.title} | @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
     if pr.body:
         data += f"Description: {pr.body}\n"
     if rctx.focus_areas:
@@ -755,10 +747,10 @@ async def _review_batch(
             max_tokens=8192,
         )
     except (ValueError, RuntimeError) as exc:
-        logger.warning("v3: review batch failed: %s", exc)
+        logger.warning("thorough: review batch failed: %s", exc)
 
     for f in findings:
-        logger.info("v3: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title)
+        logger.info("thorough: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title)
     return findings
 
 
@@ -805,7 +797,7 @@ async def _verify_findings(
         Call this when your investigation confirms the issue exists.
         Provide the evidence you found and an updated confidence score.
         """
-        logger.info("v3: CONFIRMED [%s] %s:%s — %s", severity, path, line, title)
+        logger.info("thorough: CONFIRMED [%s] %s:%s — %s", severity, path, line, title)
         confirmed.append(
             ReviewComment(
                 path=path,
@@ -832,7 +824,7 @@ async def _verify_findings(
         Call this when your investigation shows the issue doesn't exist,
         is handled elsewhere, or is inconclusive.
         """
-        logger.info("v3: DISMISSED %s — %s", title, reason[:80])
+        logger.info("thorough: DISMISSED %s — %s", title, reason[:80])
         return f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
 
     # --- Build compact finding list ---
@@ -849,8 +841,7 @@ async def _verify_findings(
     n = len(findings)
     data = (
         f"PR #{pr.number}: {pr.title} | @{pr.author.login}\n"
-        f"Verify {n} findings:\n\n"
-        + "\n\n".join(finding_lines)
+        f"Verify {n} findings:\n\n" + "\n\n".join(finding_lines)
     )
 
     exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
@@ -866,7 +857,7 @@ async def _verify_findings(
             max_tokens=8192,
         )
     except (ValueError, RuntimeError) as exc:
-        logger.warning("v3: verify failed: %s", exc)
+        logger.warning("thorough: verify failed: %s", exc)
 
     return confirmed
 

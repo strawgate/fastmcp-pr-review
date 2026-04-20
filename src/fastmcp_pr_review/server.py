@@ -1,10 +1,11 @@
-"""FastMCP server exposing three PR review tools of increasing depth."""
+"""FastMCP server exposing fast and thorough PR review modes."""
 
 from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
 
+import click
 import logfire
 from fastmcp import Context, FastMCP
 
@@ -20,6 +21,11 @@ from fastmcp_pr_review.models import (
 
 if TYPE_CHECKING:
     from fastmcp.client.sampling import SamplingHandler
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PATH = "/mcp/"
 
 
 def _format_timeline_event(event: TimelineEvent) -> str:
@@ -67,7 +73,7 @@ def _make_gemini_handler(model: str) -> SamplingHandler:
 def create_server(
     *,
     github_token: str | None = None,
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
     sampling_handler: SamplingHandler | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP PR review server."""
@@ -86,10 +92,9 @@ def create_server(
     mcp = FastMCP(
         name="pr-review",
         instructions=(
-            "GitHub PR review server with three tools of increasing depth:\n"
-            "- review_pr_simple: Quick single-shot review (one LLM call)\n"
-            "- review_pr: Per-file review with tools (LLM explores the repo)\n"
-            "- review_pr_deep: Production pipeline (filter + review + verify)"
+            "GitHub PR review server with two review modes:\n"
+            "- review_pr_fast: Quick single-shot review (one LLM call)\n"
+            "- review_pr_thorough: Multi-pass pipeline (filter + review + verify)"
         ),
         sampling_handler=handler,
         sampling_handler_behavior="fallback",
@@ -142,16 +147,16 @@ def create_server(
         )
         return project_ctx, issues
 
-    # ── v1: Simple (one sample call, structured output, no tools) ────────
+    # ── Fast mode: one sample call, structured output, no tools ──────────
 
     @mcp.tool
-    async def review_pr_simple(
+    async def review_pr_fast(
         repo: str,
         pr_number: int,
         focus_areas: str | None = None,
         ctx: Context | None = None,
     ) -> PRReviewResult:
-        """Fast single-shot PR review using structured output only.
+        """Fast PR review using a single structured sampling call.
 
         One LLM call — sends the full diff and gets back a structured
         review result. No tool calling. Best for small PRs or quick checks.
@@ -162,10 +167,10 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
         assert ctx is not None
-        from fastmcp_pr_review.v1_simple import simple_review
+        from fastmcp_pr_review.fast import fast_review
 
         project_ctx, issues = await _gather_context(repo, pr_number)
-        return await simple_review(
+        return await fast_review(
             gh,
             ctx,
             repo,
@@ -175,51 +180,17 @@ def create_server(
             linked_issues=issues,
         )
 
-    # ── v2: Per-file review with tools ──────────────────────────────────
+    # ── Thorough mode: multi-pass pipeline ────────────────────────────────
 
     @mcp.tool
-    async def review_pr(
-        repo: str,
-        pr_number: int,
-        focus_areas: str | None = None,
-        ctx: Context | None = None,
-    ) -> PRReviewResult:
-        """Per-file PR review with tool calling.
-
-        Loops over each changed file and reviews it individually.
-        The LLM can call tools to read other files, look up diffs,
-        and explore the codebase during review.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-            focus_areas: Optional areas to focus on (e.g. 'security')
-        """
-        assert ctx is not None
-        from fastmcp_pr_review.v2_per_file import per_file_review
-
-        project_ctx, issues = await _gather_context(repo, pr_number)
-        return await per_file_review(
-            gh,
-            ctx,
-            repo,
-            pr_number,
-            focus_areas=focus_areas,
-            project_context=project_ctx,
-            linked_issues=issues,
-        )
-
-    # ── v3: Production pipeline ──────────────────────────────────────────
-
-    @mcp.tool
-    async def review_pr_deep(
+    async def review_pr_thorough(
         repo: str,
         pr_number: int,
         focus_areas: str | None = None,
         intensity: str = "balanced",
         ctx: Context | None = None,
     ) -> PRReviewResult:
-        """Production PR review: filter + review + agentic verification.
+        """Thorough PR review: filter + review + agentic verification.
 
         Multi-pass pipeline with prior review awareness, intelligent
         file filtering, per-file review with verification protocol,
@@ -233,10 +204,10 @@ def create_server(
             intensity: Review depth — conservative, balanced, aggressive
         """
         assert ctx is not None
-        from fastmcp_pr_review.v3_production import production_review
+        from fastmcp_pr_review.thorough import thorough_review
 
         project_ctx, issues = await _gather_context(repo, pr_number)
-        return await production_review(
+        return await thorough_review(
             gh,
             ctx,
             repo,
@@ -250,10 +221,85 @@ def create_server(
     return mcp
 
 
+def _load_env_file() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+
+def _apply_runtime_env(*, gemini_api_key: str | None) -> None:
+    if gemini_api_key is not None:
+        os.environ["GEMINI_API_KEY"] = gemini_api_key
+
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--github-token",
+    envvar="GITHUB_TOKEN",
+    show_envvar=True,
+    help="Override GITHUB_TOKEN for this server process.",
+)
+@click.option(
+    "--gemini-api-key",
+    envvar="GEMINI_API_KEY",
+    show_envvar=True,
+    help="Override GEMINI_API_KEY for this server process.",
+)
+@click.option(
+    "--gemini-model",
+    default=DEFAULT_GEMINI_MODEL,
+    show_default=True,
+    help="Fallback Gemini model when the MCP client cannot provide sampling.",
+)
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"], case_sensitive=False),
+    default="stdio",
+    show_default=True,
+    help="Server transport to run.",
+)
+@click.option(
+    "--host",
+    default=DEFAULT_HTTP_HOST,
+    show_default=True,
+    help="Host to bind when running with HTTP transport.",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_HTTP_PORT,
+    show_default=True,
+    type=int,
+    help="Port to bind when running with HTTP transport.",
+)
+@click.option(
+    "--path",
+    "http_path",
+    default=DEFAULT_HTTP_PATH,
+    show_default=True,
+    help="HTTP MCP path when running with HTTP transport.",
+)
+def cli(
+    github_token: str | None,
+    gemini_api_key: str | None,
+    gemini_model: str,
+    transport: str,
+    host: str,
+    port: int,
+    http_path: str,
+) -> None:
+    """Run the FastMCP PR review MCP server."""
+    _load_env_file()
+    _apply_runtime_env(gemini_api_key=gemini_api_key)
+    server = create_server(github_token=github_token, gemini_model=gemini_model)
+    if transport == "http":
+        server.run(transport="http", host=host, port=port, path=http_path)
+        return
+    server.run(transport="stdio")
+
+
 def main() -> None:
     """Entry point for the MCP server."""
-    server = create_server()
-    server.run()
+    cli.main(standalone_mode=False)
 
 
 if __name__ == "__main__":

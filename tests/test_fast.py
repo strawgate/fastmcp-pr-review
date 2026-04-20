@@ -1,12 +1,11 @@
-"""Tests for v1 simple single-shot review."""
+"""Tests for the fast single-shot review mode."""
 
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Note: tests call simple_review() directly with project_context=""
-# and linked_issues=[] as defaults — no mocking needed.
+from fastmcp_pr_review.fast import fast_review
 from fastmcp_pr_review.models import (
     PRAuthor,
     PRDetails,
@@ -16,7 +15,9 @@ from fastmcp_pr_review.models import (
     PRTimeline,
     ReviewState,
 )
-from fastmcp_pr_review.v1_simple import simple_review
+
+# Note: tests call fast_review() directly with project_context=""
+# and linked_issues=[] as defaults — no mocking needed.
 
 
 def _make_timeline() -> PRTimeline:
@@ -56,16 +57,16 @@ def _make_result() -> PRReviewResult:
     )
 
 
-class TestSimpleReview:
+class TestFastReview:
     @pytest.mark.asyncio
     async def test_single_sample_call_no_tools(self) -> None:
-        """v1 makes exactly one ctx.sample() call with no tools."""
+        """Fast mode makes exactly one ctx.sample() call with no tools."""
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
 
-        result = await simple_review(gh, ctx, "owner/repo", 1)
+        result = await fast_review(gh, ctx, "owner/repo", 1)
 
         assert result.verdict == ReviewState.APPROVED
         ctx.sample.assert_awaited_once()
@@ -75,14 +76,14 @@ class TestSimpleReview:
 
     @pytest.mark.asyncio
     async def test_does_not_call_get_diff(self) -> None:
-        """v1 uses timeline file patches, never calls get_diff separately."""
+        """Fast mode uses timeline file patches, never calls get_diff separately."""
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
         gh.get_diff = AsyncMock()
 
-        await simple_review(gh, ctx, "owner/repo", 1)
+        await fast_review(gh, ctx, "owner/repo", 1)
 
         gh.get_diff.assert_not_awaited()
 
@@ -93,7 +94,7 @@ class TestSimpleReview:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
 
-        await simple_review(gh, ctx, "owner/repo", 1, focus_areas="security")
+        await fast_review(gh, ctx, "owner/repo", 1, focus_areas="security")
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "security" in messages
@@ -105,7 +106,7 @@ class TestSimpleReview:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=_make_timeline())
 
-        await simple_review(gh, ctx, "owner/repo", 1)
+        await fast_review(gh, ctx, "owner/repo", 1)
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "src/main.py" in messages
@@ -129,7 +130,7 @@ class TestSimpleReview:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=timeline)
 
-        await simple_review(gh, ctx, "owner/repo", 1)
+        await fast_review(gh, ctx, "owner/repo", 1)
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "(no patches available)" in messages
