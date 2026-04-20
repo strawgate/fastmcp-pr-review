@@ -173,15 +173,21 @@ class TestVerifyFindings:
 class TestAggregate:
     def test_with_confirmed_comments(self) -> None:
         result = _aggregate(
-            [_make_comment()], total_files=1,
-            files_reviewed=1, files_skipped=0, min_confidence=50,
+            [_make_comment()],
+            total_files=1,
+            files_reviewed=1,
+            files_skipped=0,
+            min_confidence=50,
         )
         assert len(result.comments) == 1
 
     def test_empty_comments(self) -> None:
         result = _aggregate(
-            [], total_files=1,
-            files_reviewed=1, files_skipped=0, min_confidence=50,
+            [],
+            total_files=1,
+            files_reviewed=1,
+            files_skipped=0,
+            min_confidence=50,
         )
         assert result.verdict == ReviewState.APPROVED
         assert len(result.comments) == 0
@@ -189,8 +195,11 @@ class TestAggregate:
     def test_confidence_filter(self) -> None:
         low = _make_comment(confidence=30)
         result = _aggregate(
-            [low], total_files=1,
-            files_reviewed=1, files_skipped=0, min_confidence=50,
+            [low],
+            total_files=1,
+            files_reviewed=1,
+            files_skipped=0,
+            min_confidence=50,
         )
         assert len(result.comments) == 0
 
@@ -208,8 +217,12 @@ class TestReviewFiles:
 
         chunks = [
             DiffChunk(
-                index=0, filename="a.py", status="modified",
-                additions=5, deletions=0, patch="+x",
+                index=0,
+                filename="a.py",
+                status="modified",
+                additions=5,
+                deletions=0,
+                patch="+x",
             )
         ]
         results = await _review_files(rctx, chunks=chunks)
@@ -233,8 +246,12 @@ class TestReviewFiles:
 
         chunks = [
             DiffChunk(
-                index=0, filename="b.py", status="modified",
-                additions=2, deletions=1, patch="+y",
+                index=0,
+                filename="b.py",
+                status="modified",
+                additions=2,
+                deletions=1,
+                patch="+y",
             )
         ]
         results = await _review_files(rctx, chunks=chunks)
@@ -245,9 +262,7 @@ class TestFullPipeline:
     @pytest.mark.asyncio
     async def test_filter_and_review_passes(self) -> None:
         """filter + review = 2 sample calls when review finds nothing."""
-        filter_result = FilterBatchResult(
-            chunks=[FilteredChunk(index=0, skip=False)]
-        )
+        filter_result = FilterBatchResult(chunks=[FilteredChunk(index=0, skip=False)])
         review_done = ReviewDone(summary="All clean")
 
         ctx = MagicMock()

@@ -60,7 +60,6 @@ SKIP_PATTERNS = [
 ]  # fmt: skip
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Review context — bundles shared state passed through the pipeline
 # ═══════════════════════════════════════════════════════════════════════════
@@ -365,7 +364,10 @@ async def thorough_review(
         intensity=intensity,
     ):
         return await _thorough_review_inner(
-            gh, ctx, repo, pr_number,
+            gh,
+            ctx,
+            repo,
+            pr_number,
             focus_areas=focus_areas,
             intensity=intensity,
             max_files=max_files,
@@ -527,8 +529,7 @@ async def _filter_files(
         data = (
             f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
             f"{pr.head_ref} -> {pr.base_ref}\n"
-            f"Classify {len(batch)} files:\n\n"
-            + "\n\n".join(chunk_texts)
+            f"Classify {len(batch)} files:\n\n" + "\n\n".join(chunk_texts)
         )
 
         r = await ctx.sample(
@@ -605,10 +606,7 @@ def _make_batches(
             batches.append([c])
             continue
 
-        if (
-            current_size + patch_size > max_bytes
-            or len(current) >= max_items
-        ):
+        if current_size + patch_size > max_bytes or len(current) >= max_items:
             batches.append(current)
             current, current_size = [], 0
 
@@ -657,8 +655,7 @@ async def _review_batch(
         threads_text = "(none)"
         if existing:
             threads_text = "\n".join(
-                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}"
-                for t in existing
+                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
             )
         file_sections.append(
             f"<file_diff>\n"
@@ -677,9 +674,7 @@ async def _review_batch(
     # Format project context and linked issues
     project_section = ""
     if rctx.project_context:
-        project_section = (
-            f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
-        )
+        project_section = f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
 
     issues_section = ""
     if rctx.linked_issues:
@@ -692,10 +687,7 @@ async def _review_batch(
         )
 
     data = f"Intensity: {rctx.intensity}\n"
-    data += (
-        f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
-        f"{pr.head_ref} -> {pr.base_ref}\n"
-    )
+    data += f"PR #{pr.number}: {pr.title} | @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
     if pr.body:
         data += f"Description: {pr.body}\n"
     if rctx.focus_areas:
@@ -849,8 +841,7 @@ async def _verify_findings(
     n = len(findings)
     data = (
         f"PR #{pr.number}: {pr.title} | @{pr.author.login}\n"
-        f"Verify {n} findings:\n\n"
-        + "\n\n".join(finding_lines)
+        f"Verify {n} findings:\n\n" + "\n\n".join(finding_lines)
     )
 
     exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
