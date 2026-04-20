@@ -36,7 +36,7 @@ uv run fastmcp-pr-review
 uv run fastmcp-pr-review --gemini-model gemini-2.5-pro
 ```
 
-The server auto-loads `.env` when started from the repo directory.
+The server auto-loads `.env` when started from the repo directory, and the Click launcher also reads `GITHUB_TOKEN` and `GEMINI_API_KEY` directly from the process environment. That means hosted environments like Horizon can inject those vars without extra CLI flags.
 
 The server also exposes data tools: `get_pr_info`, `get_pr_diff`, `get_pr_files`.
 
@@ -64,7 +64,7 @@ Add the server to your Claude MCP config with a stdio entry that runs this repo 
 }
 ```
 
-Keep `GITHUB_TOKEN` and `GEMINI_API_KEY` in `/absolute/path/to/fastmcp-pr-review/.env` so Claude does not need inline secrets in its MCP config.
+Keep `GITHUB_TOKEN` and `GEMINI_API_KEY` in `/absolute/path/to/fastmcp-pr-review/.env` or inject them via the host environment so Claude does not need inline secrets in its MCP config.
 Use CLI flags for non-secret runtime settings like the fallback Gemini model.
 
 ## Development

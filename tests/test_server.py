@@ -85,18 +85,55 @@ class TestCreateServer:
 
         with (
             patch.object(server_module, "_load_env_file") as load_env_file,
+            patch.object(server_module, "_apply_runtime_env") as apply_runtime_env,
             patch.object(server_module, "create_server", return_value=mock_server) as create_server,
         ):
             result = runner.invoke(
                 cli,
-                ["--github-token", "cli-token", "--gemini-model", "gemini-2.5-pro"],
+                [
+                    "--github-token",
+                    "cli-token",
+                    "--gemini-api-key",
+                    "cli-gemini-key",
+                    "--gemini-model",
+                    "gemini-2.5-pro",
+                ],
             )
 
         assert result.exit_code == 0
         load_env_file.assert_called_once_with()
+        apply_runtime_env.assert_called_once_with(gemini_api_key="cli-gemini-key")
         create_server.assert_called_once_with(
             github_token="cli-token",
             gemini_model="gemini-2.5-pro",
+        )
+        mock_server.run.assert_called_once_with()
+
+    def test_cli_reads_hosted_env_vars(self) -> None:
+        from fastmcp_pr_review import server as server_module
+
+        mock_server = MagicMock()
+        runner = CliRunner()
+
+        with (
+            patch.object(server_module, "_load_env_file"),
+            patch.object(server_module, "_apply_runtime_env") as apply_runtime_env,
+            patch.object(server_module, "create_server", return_value=mock_server) as create_server,
+        ):
+            result = runner.invoke(
+                cli,
+                [],
+                env={
+                    "GITHUB_TOKEN": "horizon-github-token",
+                    "GEMINI_API_KEY": "horizon-gemini-key",
+                },
+            )
+
+        assert result.exit_code == 0
+        apply_runtime_env.assert_called_once_with(gemini_api_key="horizon-gemini-key")
+        create_server.assert_called_once_with(
+            github_token="horizon-github-token",
+            gemini_model="gemini-2.5-flash",
         )
         mock_server.run.assert_called_once_with()
 

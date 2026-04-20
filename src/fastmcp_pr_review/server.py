@@ -259,10 +259,23 @@ def _load_env_file() -> None:
     load_dotenv()
 
 
+def _apply_runtime_env(*, gemini_api_key: str | None) -> None:
+    if gemini_api_key is not None:
+        os.environ["GEMINI_API_KEY"] = gemini_api_key
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option(
     "--github-token",
+    envvar="GITHUB_TOKEN",
+    show_envvar=True,
     help="Override GITHUB_TOKEN for this server process.",
+)
+@click.option(
+    "--gemini-api-key",
+    envvar="GEMINI_API_KEY",
+    show_envvar=True,
+    help="Override GEMINI_API_KEY for this server process.",
 )
 @click.option(
     "--gemini-model",
@@ -270,9 +283,10 @@ def _load_env_file() -> None:
     show_default=True,
     help="Fallback Gemini model when the MCP client cannot provide sampling.",
 )
-def cli(github_token: str | None, gemini_model: str) -> None:
+def cli(github_token: str | None, gemini_api_key: str | None, gemini_model: str) -> None:
     """Run the FastMCP PR review MCP server."""
     _load_env_file()
+    _apply_runtime_env(gemini_api_key=gemini_api_key)
     server = create_server(github_token=github_token, gemini_model=gemini_model)
     server.run()
 
