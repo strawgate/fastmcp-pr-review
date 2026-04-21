@@ -317,7 +317,7 @@ You will receive a list of findings from the review pass. For each one:
 1. Read the verification_needs field to understand what to check
 2. Use get_file_contents() to read the relevant source code
 3. Trace the data flow, check callers, look for guards and handlers
-4. Call confirm_finding() if the issue is real, dismiss_finding() if not
+4. Call confirm_finding(index=...) if the issue is real, dismiss_finding(index=...) if not
 
 Rules:
 - Every finding MUST be confirmed or dismissed EXACTLY ONCE
@@ -737,17 +737,14 @@ async def _review_batch(
 
     exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
 
-    try:
-        await rctx.ctx.sample(
-            messages=[REVIEW_INSTRUCTIONS, data],
-            system_prompt=SYSTEM_PROMPT,
-            result_type=ReviewDone,
-            tools=[add_finding, *exploration_tools],
-            temperature=0.2,
-            max_tokens=8192,
-        )
-    except (ValueError, RuntimeError) as exc:
-        logger.warning("thorough: review batch failed: %s", exc)
+    await rctx.ctx.sample(
+        messages=[REVIEW_INSTRUCTIONS, data],
+        system_prompt=SYSTEM_PROMPT,
+        result_type=ReviewDone,
+        tools=[add_finding, *exploration_tools],
+        temperature=0.2,
+        max_tokens=8192,
+    )
 
     for f in findings:
         logger.info("thorough: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title)
@@ -777,40 +774,62 @@ async def _verify_findings(
 
     # --- State that accumulates across the tool loop ---
     confirmed: list[ReviewComment] = []
+    processed_indices: set[int] = set()
 
     # --- Finding management tools ---
 
+    def _get_finding(index: int, action: str) -> PotentialFinding:
+        if index < 0 or index >= len(findings):
+            msg = f"Invalid finding index {index} for {action}"
+            raise ValueError(msg)
+        if index in processed_indices:
+            msg = f"Finding index {index} already processed"
+            raise ValueError(msg)
+        return findings[index]
+
     def confirm_finding(
-        title: str,
+        index: int,
         evidence: str,
-        path: str,
+        title: str | None = None,
+        path: str | None = None,
         line: int | None = None,
-        severity: str = "medium",
-        category: str = "bug",
+        end_line: int | None = None,
+        severity: str | None = None,
+        category: str | None = None,
         body: str = "",
         why: str = "",
         suggested_code: str | None = None,
-        confidence: int = 80,
+        confidence: int | None = None,
     ) -> str:
         """Confirm a finding is real and add it to the review.
 
         Call this when your investigation confirms the issue exists.
         Provide the evidence you found and an updated confidence score.
         """
+        finding = _get_finding(index, "confirmation")
+        title = title or finding.title
+        path = path or finding.path
+        line = finding.line if line is None else line
+        end_line = finding.end_line if end_line is None else end_line
+        severity = severity or finding.severity.value
+        category = category or finding.category.value
+        suggested_code = suggested_code or finding.suggested_code
+        confidence = finding.confidence if confidence is None else confidence
         logger.info("thorough: CONFIRMED [%s] %s:%s — %s", severity, path, line, title)
-        confirmed.append(
-            ReviewComment(
-                path=path,
-                line=line,
-                severity=Severity(severity),
-                category=CommentCategory(category),
-                title=title,
-                body=body or f"Confirmed: {title}",
-                why=why or evidence,
-                suggested_code=suggested_code,
-                confidence=confidence,
-            )
+        comment = ReviewComment(
+            path=path,
+            line=line,
+            end_line=end_line,
+            severity=Severity(severity),
+            category=CommentCategory(category),
+            title=title,
+            body=body or finding.body,
+            why=why or evidence or finding.why,
+            suggested_code=suggested_code,
+            confidence=confidence,
         )
+        processed_indices.add(index)
+        confirmed.append(comment)
         already = [c.title for c in confirmed]
         return (
             f"Confirmed '{title}' (confidence={confidence}). "
@@ -818,12 +837,15 @@ async def _verify_findings(
             f"Move on to the next unprocessed finding."
         )
 
-    def dismiss_finding(title: str, reason: str) -> str:
+    def dismiss_finding(index: int, reason: str, title: str | None = None) -> str:
         """Dismiss a finding — it's not a real issue.
 
         Call this when your investigation shows the issue doesn't exist,
         is handled elsewhere, or is inconclusive.
         """
+        finding = _get_finding(index, "dismissal")
+        title = title or finding.title
+        processed_indices.add(index)
         logger.info("thorough: DISMISSED %s — %s", title, reason[:80])
         return f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
 
@@ -847,17 +869,19 @@ async def _verify_findings(
     exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
 
     # --- Agentic sampling with tool-based result collection ---
-    try:
-        await rctx.ctx.sample(
-            messages=[VERIFY_INSTRUCTIONS, data],
-            system_prompt=SYSTEM_PROMPT,
-            result_type=VerifyComplete,
-            tools=[confirm_finding, dismiss_finding, *exploration_tools],
-            temperature=0.2,
-            max_tokens=8192,
-        )
-    except (ValueError, RuntimeError) as exc:
-        logger.warning("thorough: verify failed: %s", exc)
+    await rctx.ctx.sample(
+        messages=[VERIFY_INSTRUCTIONS, data],
+        system_prompt=SYSTEM_PROMPT,
+        result_type=VerifyComplete,
+        tools=[confirm_finding, dismiss_finding, *exploration_tools],
+        temperature=0.2,
+        max_tokens=8192,
+    )
+
+    if len(processed_indices) != len(findings):
+        unprocessed = [f.title for i, f in enumerate(findings) if i not in processed_indices]
+        msg = f"Verification left findings unprocessed: {unprocessed}"
+        raise RuntimeError(msg)
 
     return confirmed
 

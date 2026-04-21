@@ -13,6 +13,7 @@ src/fastmcp_pr_review/
 tests/
     conftest.py          Shared fixtures (PR data models)
     test_models.py       Model validation, scoring helpers
+    test_context.py      Project context + linked issue extraction
     test_github_client.py  GitHub API wrapper (mocked)
     test_server.py       Tool registration, timeline formatting
     test_fast.py         fast review function
@@ -39,6 +40,7 @@ uv run ty check                   # Type check
 uv build                          # Build sdist + wheel with uv
 uv run fastmcp-pr-review          # Run the server
 uv run python scripts/run_review.py owner/repo 123 fast  # Dev smoke test
+uv run python scripts/run_review.py owner/repo 123 thorough --intensity aggressive
 ```
 
 ## How Sampling Works

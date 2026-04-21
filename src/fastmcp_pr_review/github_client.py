@@ -25,7 +25,7 @@ from fastmcp_pr_review.models import (
 def _parse_owner_repo(repo: str) -> tuple[str, str]:
     """Parse 'owner/repo' string into (owner, repo) tuple."""
     parts = repo.split("/")
-    if len(parts) != 2:
+    if len(parts) != 2 or not parts[0] or not parts[1]:
         msg = f"Invalid repo format '{repo}', expected 'owner/repo'"
         raise ValueError(msg)
     return parts[0], parts[1]

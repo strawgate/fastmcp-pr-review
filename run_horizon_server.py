@@ -1,8 +1,12 @@
 """Horizon import entrypoint for the FastMCP PR review server."""
 
-from fastmcp_pr_review.server import _load_env_file, create_server
+from pathlib import Path
 
-_load_env_file()
+from dotenv import load_dotenv
+
+from fastmcp_pr_review.server import create_server
+
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 mcp = create_server()
 
 

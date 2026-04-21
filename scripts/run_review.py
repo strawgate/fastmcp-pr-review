@@ -1,9 +1,9 @@
 """Run PR reviews through the real MCP server with full OTEL tracing."""
 
+import argparse
 import asyncio
 import json
 import logging
-import sys
 import time
 
 import logfire
@@ -32,6 +32,26 @@ TOOL_MAP = {
 }
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run an in-process smoke test against the FastMCP PR review server.",
+    )
+    parser.add_argument("repo", help="Repository in owner/repo format.")
+    parser.add_argument("pr_number", type=int, help="Pull request number to review.")
+    parser.add_argument(
+        "mode",
+        choices=sorted(TOOL_MAP),
+        help="Review mode to invoke.",
+    )
+    parser.add_argument(
+        "--intensity",
+        choices=["conservative", "balanced", "aggressive"],
+        default="balanced",
+        help="Thorough-mode intensity.",
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
     from dotenv import load_dotenv
 
@@ -41,9 +61,10 @@ async def main() -> None:
 
     from fastmcp_pr_review.server import create_server
 
-    repo = sys.argv[1] if len(sys.argv) > 1 else "strawgate/memagent"
-    pr_number = int(sys.argv[2]) if len(sys.argv) > 2 else 1821
-    mode = sys.argv[3] if len(sys.argv) > 3 else "fast"
+    args = _parse_args()
+    repo = args.repo
+    pr_number = args.pr_number
+    mode = args.mode
 
     tool_name = TOOL_MAP.get(mode)
     if not tool_name:
@@ -61,11 +82,11 @@ async def main() -> None:
         t0 = time.monotonic()
 
         # Call the tool through MCP — full protocol, real spans
-        args = {"repo": repo, "pr_number": pr_number}
+        tool_args = {"repo": repo, "pr_number": pr_number}
         if mode == "thorough":
-            args["intensity"] = "balanced"
+            tool_args["intensity"] = args.intensity
 
-        call_result = await client.call_tool(tool_name, args)
+        call_result = await client.call_tool(tool_name, tool_args)
         elapsed = time.monotonic() - t0
 
         # Extract the JSON result from the CallToolResult

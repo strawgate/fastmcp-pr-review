@@ -62,10 +62,11 @@ def _make_timeline() -> PRTimeline:
     )
 
 
-def _make_finding(confidence: int = 80) -> PotentialFinding:
+def _make_finding(confidence: int = 80, end_line: int | None = None) -> PotentialFinding:
     return PotentialFinding(
         path="src/main.py",
         line=10,
+        end_line=end_line,
         severity=Severity.HIGH,
         category=CommentCategory.SECURITY,
         title="SQL injection",
@@ -149,11 +150,15 @@ class TestVerifyFindings:
     async def test_calls_sample_with_finding_tools(self) -> None:
         """Verify pass should provide confirm/dismiss + exploration tools."""
         rctx = _make_rctx()
-        rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
-            return_value=MagicMock(result=VerifyComplete(summary="Done"))
-        )
 
-        await _verify_findings(rctx, findings=[_make_finding()])
+        async def sample_side_effect(*args, **kwargs):
+            tools = {tool.__name__: tool for tool in kwargs["tools"]}
+            tools["confirm_finding"](index=0, evidence="Verified in source", confidence=95)
+            return MagicMock(result=VerifyComplete(summary="Done"))
+
+        rctx.ctx.sample = AsyncMock(side_effect=sample_side_effect)  # ty: ignore[invalid-assignment]
+
+        result = await _verify_findings(rctx, findings=[_make_finding()])
 
         call_kwargs = rctx.ctx.sample.call_args.kwargs  # ty: ignore[unresolved-attribute]
         tool_names = [t.__name__ for t in call_kwargs["tools"]]
@@ -161,6 +166,22 @@ class TestVerifyFindings:
         assert "dismiss_finding" in tool_names
         assert "get_file_contents" in tool_names
         assert call_kwargs["result_type"] is VerifyComplete
+        assert result[0].confidence == 95
+
+    @pytest.mark.asyncio
+    async def test_preserves_end_line_on_confirmation(self) -> None:
+        rctx = _make_rctx()
+
+        async def sample_side_effect(*args, **kwargs):
+            tools = {tool.__name__: tool for tool in kwargs["tools"]}
+            tools["confirm_finding"](index=0, evidence="Verified span")
+            return MagicMock(result=VerifyComplete(summary="Done"))
+
+        rctx.ctx.sample = AsyncMock(side_effect=sample_side_effect)  # ty: ignore[invalid-assignment]
+
+        result = await _verify_findings(rctx, findings=[_make_finding(end_line=14)])
+
+        assert result[0].end_line == 14
 
     @pytest.mark.asyncio
     async def test_skips_empty_findings(self) -> None:
@@ -168,6 +189,14 @@ class TestVerifyFindings:
         result = await _verify_findings(rctx, findings=[])
         assert result == []
         rctx.ctx.sample.assert_not_awaited()  # ty: ignore[unresolved-attribute]
+
+    @pytest.mark.asyncio
+    async def test_raises_when_findings_are_left_unprocessed(self) -> None:
+        rctx = _make_rctx()
+        rctx.ctx.sample = AsyncMock(return_value=MagicMock(result=VerifyComplete(summary="Done")))  # ty: ignore[invalid-assignment]
+
+        with pytest.raises(RuntimeError, match="unprocessed"):
+            await _verify_findings(rctx, findings=[_make_finding()])
 
 
 class TestAggregate:
@@ -256,6 +285,27 @@ class TestReviewFiles:
         ]
         results = await _review_files(rctx, chunks=chunks)
         assert results == []
+
+    @pytest.mark.asyncio
+    async def test_review_batch_failures_propagate(self) -> None:
+        from fastmcp_pr_review.thorough import DiffChunk
+
+        rctx = _make_rctx()
+        rctx.ctx.sample = AsyncMock(side_effect=RuntimeError("boom"))  # ty: ignore[invalid-assignment]
+
+        chunks = [
+            DiffChunk(
+                index=0,
+                filename="c.py",
+                status="modified",
+                additions=1,
+                deletions=0,
+                patch="+z",
+            )
+        ]
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await _review_files(rctx, chunks=chunks)
 
 
 class TestFullPipeline:

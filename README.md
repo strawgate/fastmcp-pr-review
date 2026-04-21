@@ -28,6 +28,7 @@ cp .env.example .env
 
 uv run fastmcp-pr-review
 # or override runtime settings explicitly
+uv run fastmcp-pr-review --transport http --host 0.0.0.0 --port 8000
 uv run fastmcp-pr-review --gemini-model gemini-2.5-pro
 make server-stdio
 make server-http HOST=0.0.0.0 PORT=8000
@@ -35,17 +36,27 @@ make server-http HOST=0.0.0.0 PORT=8000
 
 The server auto-loads `.env` when started from the repo directory, and the Click launcher also reads `GITHUB_TOKEN` and `GEMINI_API_KEY` directly from the process environment. That means hosted environments like Horizon can inject those vars without extra CLI flags.
 
+Common runtime flags:
+
+| Flag | Purpose |
+|------|---------|
+| `--github-token` | Override `GITHUB_TOKEN` for this process |
+| `--gemini-api-key` | Override `GEMINI_API_KEY` for this process |
+| `--gemini-model` | Set the fallback Gemini model |
+| `--transport stdio|http` | Choose MCP transport |
+| `--host`, `--port`, `--path` | Configure the HTTP listener |
+
 The server also exposes data tools: `get_pr_info`, `get_pr_diff`, `get_pr_files`.
 
 ## Deploy to Horizon
 
-For Horizon-style deployments that import a module and look for an `mcp` object, point it at the repo-root `run_horizon_server.py`. That file loads env vars and exposes:
+For Horizon-style deployments that import a module and look for an `mcp` object, point it at the repo-root `run_horizon_server.py`. That entrypoint loads `.env` from the repo root if present, preserves env vars already injected by Horizon, and exposes:
 
 ```python
 mcp = create_server()
 ```
 
-Set `GITHUB_TOKEN` and `GEMINI_API_KEY` in Horizon, and it can import `run_horizon_server.py` directly.
+Set `GITHUB_TOKEN` and `GEMINI_API_KEY` in Horizon, then configure the service to import `run_horizon_server.py` and use the exported `mcp` object.
 
 ## Add to Claude
 
@@ -87,6 +98,8 @@ make lint-fix
 make typecheck
 make test
 make build
+uv run python scripts/run_review.py owner/repo 123 fast
+uv run python scripts/run_review.py owner/repo 123 thorough --intensity aggressive
 ```
 
 ## Development

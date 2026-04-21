@@ -28,6 +28,14 @@ DEFAULT_HTTP_PORT = 8000
 DEFAULT_HTTP_PATH = "/mcp/"
 
 
+def _require_sampling_context(ctx: Context | None) -> Context:
+    """Ensure a review tool received the sampling context required to run."""
+    if ctx is None:
+        msg = "Sampling context is required to run review tools."
+        raise ValueError(msg)
+    return ctx
+
+
 def _format_timeline_event(event: TimelineEvent) -> str:
     ts = event.timestamp.isoformat() if event.timestamp else "unknown"
     prefix = f"[{ts}] @{event.author.login}"
@@ -166,7 +174,7 @@ def create_server(
             pr_number: The pull request number
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
-        assert ctx is not None
+        ctx = _require_sampling_context(ctx)
         from fastmcp_pr_review.fast import fast_review
 
         project_ctx, issues = await _gather_context(repo, pr_number)
@@ -203,7 +211,7 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
             intensity: Review depth — conservative, balanced, aggressive
         """
-        assert ctx is not None
+        ctx = _require_sampling_context(ctx)
         from fastmcp_pr_review.thorough import thorough_review
 
         project_ctx, issues = await _gather_context(repo, pr_number)

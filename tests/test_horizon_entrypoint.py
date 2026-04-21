@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 
 def test_horizon_entrypoint_exposes_mcp() -> None:
+    import dotenv
+
     from fastmcp_pr_review import server as server_module
 
     entrypoint = Path(__file__).resolve().parents[1] / "run_horizon_server.py"
@@ -19,11 +21,11 @@ def test_horizon_entrypoint_exposes_mcp() -> None:
     mock_server = MagicMock()
 
     with (
-        patch.object(server_module, "_load_env_file") as load_env_file,
+        patch.object(dotenv, "load_dotenv") as load_dotenv,
         patch.object(server_module, "create_server", return_value=mock_server) as create_server,
     ):
         spec.loader.exec_module(module)
 
-    load_env_file.assert_called_once_with()
+    load_dotenv.assert_called_once_with(entrypoint.parent / ".env", override=False)
     create_server.assert_called_once_with()
     assert module.mcp is mock_server

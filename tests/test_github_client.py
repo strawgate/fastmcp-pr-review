@@ -24,6 +24,12 @@ class TestParseOwnerRepo:
         with pytest.raises(ValueError, match="Invalid repo format"):
             _parse_owner_repo("a/b/c")
 
+    def test_invalid_empty_owner_or_repo(self) -> None:
+        with pytest.raises(ValueError, match="Invalid repo format"):
+            _parse_owner_repo("owner/")
+        with pytest.raises(ValueError, match="Invalid repo format"):
+            _parse_owner_repo("/repo")
+
 
 def _make_pr_response() -> SimpleNamespace:
     """Create a mock PR response matching githubkit's structure."""

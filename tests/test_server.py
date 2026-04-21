@@ -21,6 +21,7 @@ from fastmcp_pr_review.models import (
 from fastmcp_pr_review.server import (
     _format_timeline,
     _format_timeline_event,
+    _require_sampling_context,
     cli,
     create_server,
 )
@@ -76,6 +77,14 @@ class TestCreateServer:
     def test_creates_with_token(self) -> None:
         server = create_server(github_token="fake", sampling_handler=MagicMock())
         assert server is not None
+
+    def test_require_sampling_context_rejects_none(self) -> None:
+        with pytest.raises(ValueError, match="Sampling context is required"):
+            _require_sampling_context(None)
+
+    def test_require_sampling_context_returns_context(self) -> None:
+        ctx = MagicMock()
+        assert _require_sampling_context(ctx) is ctx
 
     def test_cli_loads_dotenv_and_runs(self) -> None:
         from fastmcp_pr_review import server as server_module

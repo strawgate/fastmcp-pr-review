@@ -12,6 +12,10 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from githubkit.exception import GitHubException
+
+from fastmcp_pr_review.github_client import _parse_owner_repo
+
 if TYPE_CHECKING:
     from fastmcp_pr_review.github_client import GitHubPRClient
 
@@ -102,12 +106,13 @@ async def extract_linked_issues(
 
     async def fetch_issue(num: int) -> str | None:
         try:
-            owner, repo_name = repo.split("/")
+            owner, repo_name = _parse_owner_repo(repo)
             resp = await gh._github.rest.issues.async_get(owner, repo_name, num)
             issue = resp.parsed_data
             body = (issue.body or "")[:500]
             return f"**#{num}: {issue.title}** ({issue.state})\n{body}"
-        except Exception:
+        except (GitHubException, ValueError) as exc:
+            logger.warning("Failed to fetch linked issue #%d for %s: %s", num, repo, exc)
             return None
 
     results = await asyncio.gather(*(fetch_issue(n) for n in sorted(refs)))
