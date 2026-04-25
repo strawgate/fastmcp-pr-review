@@ -15,6 +15,7 @@ from fastmcp_pr_review.models import (
     PRFile,
     PRReviewResult,
     PRTimeline,
+    ReviewInput,
     TimelineEvent,
     TimelineEventType,
 )
@@ -70,6 +71,59 @@ def _make_gemini_handler(model: str) -> SamplingHandler:
     return GoogleGenaiSamplingHandler(default_model=model)
 
 
+def _parse_diff_to_files(diff: str) -> list[PRFile]:
+    """Parse a unified diff into PRFile objects.
+
+    Simple parser — handles standard ``diff --git`` and ``---/+++`` headers.
+    Each file gets the raw patch text; line counts are best-effort.
+    """
+    import re
+
+    files: list[PRFile] = []
+    # Split on diff headers
+    parts = re.split(r"^diff --git ", diff, flags=re.MULTILINE)
+
+    for part in parts[1:]:  # skip anything before first diff header
+        lines = part.split("\n")
+        # Extract filename from "a/path b/path"
+        header = lines[0]
+        match = re.match(r"a/(.+?) b/(.+)", header)
+        if not match:
+            continue
+        filename = match.group(2)
+
+        # Determine status from the diff metadata
+        status = "modified"
+        patch_lines = []
+        for line in lines[1:]:
+            if line.startswith("new file"):
+                status = "added"
+            elif line.startswith("deleted file"):
+                status = "removed"
+            elif line.startswith("rename from"):
+                status = "renamed"
+            # Collect actual diff content (from first @@ onwards)
+            if line.startswith("@@") or (patch_lines and not line.startswith("diff --git")):
+                patch_lines.append(line)
+
+        patch = "\n".join(patch_lines) if patch_lines else None
+        additions = sum(1 for ln in patch_lines if ln.startswith("+") and not ln.startswith("+++"))
+        deletions = sum(1 for ln in patch_lines if ln.startswith("-") and not ln.startswith("---"))
+
+        files.append(
+            PRFile(
+                filename=filename,
+                status=status,
+                additions=additions,
+                deletions=deletions,
+                changes=additions + deletions,
+                patch=patch,
+            )
+        )
+
+    return files
+
+
 def create_server(
     *,
     github_token: str | None = None,
@@ -92,9 +146,10 @@ def create_server(
     mcp = FastMCP(
         name="pr-review",
         instructions=(
-            "GitHub PR review server with two review modes:\n"
-            "- review_pr_fast: Quick single-shot review (one LLM call)\n"
-            "- review_pr_thorough: Multi-pass pipeline (filter + review + verify)"
+            "GitHub code review server with three review tools:\n"
+            "- review_pr_fast: Quick single-shot PR review (one LLM call)\n"
+            "- review_pr_thorough: Multi-pass PR pipeline (filter + review + verify)\n"
+            "- review_diff_fast: Review a raw unified diff (not tied to a PR)"
         ),
         sampling_handler=handler,
         sampling_handler_behavior="fallback",
@@ -135,8 +190,13 @@ def create_server(
 
     # ── Shared context gathering ────────────────────────────────────────
 
-    async def _gather_context(repo: str, pr_number: int) -> tuple[str, list[str]]:
-        """Fetch project docs + linked issues for any review tool."""
+    async def _build_review_input(
+        repo: str,
+        pr_number: int,
+        *,
+        focus_areas: str | None = None,
+    ) -> ReviewInput:
+        """Build a ReviewInput from PR data — fetches timeline, project docs, linked issues."""
         import asyncio
 
         timeline = await gh.get_timeline(repo, pr_number)
@@ -145,7 +205,68 @@ def create_server(
             gather_project_context(gh, repo, pr.head_sha),
             extract_linked_issues(gh, repo, pr.body, pr.head_ref),
         )
-        return project_ctx, issues
+        return ReviewInput(
+            files=timeline.files,
+            title=pr.title,
+            description=pr.body or "",
+            author=pr.author.login,
+            head_ref=pr.head_ref,
+            base_ref=pr.base_ref,
+            additions=pr.additions,
+            deletions=pr.deletions,
+            changed_files=pr.changed_files,
+            project_context=project_ctx,
+            linked_issues=issues,
+            focus_areas=focus_areas,
+        )
+
+    async def _build_thorough_review_input(
+        repo: str,
+        pr_number: int,
+        *,
+        focus_areas: str | None = None,
+    ) -> tuple[ReviewInput, str]:
+        """Build ReviewInput with thorough-mode extras (threads, prior reviews).
+
+        Returns (ReviewInput, head_sha) so the caller can build a FileReader.
+        """
+        import asyncio
+
+        timeline, comments_by_file, prior_reviews = await asyncio.gather(
+            gh.get_timeline(repo, pr_number),
+            gh.get_review_comments_by_file(repo, pr_number),
+            gh.get_prior_review_bodies(repo, pr_number),
+        )
+        pr = timeline.pr
+        project_ctx, issues = await asyncio.gather(
+            gather_project_context(gh, repo, pr.head_sha),
+            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+        )
+        inp = ReviewInput(
+            files=timeline.files,
+            title=pr.title,
+            description=pr.body or "",
+            author=pr.author.login,
+            head_ref=pr.head_ref,
+            base_ref=pr.base_ref,
+            additions=pr.additions,
+            deletions=pr.deletions,
+            changed_files=pr.changed_files,
+            project_context=project_ctx,
+            linked_issues=issues,
+            focus_areas=focus_areas,
+            existing_threads=comments_by_file,
+            prior_reviews=prior_reviews,
+        )
+        return inp, pr.head_sha
+
+    def _make_pr_file_reader(repo: str, head_sha: str):
+        """Create a FileReader that reads files from a PR's head ref."""
+
+        async def file_reader(filepath: str) -> str:
+            return await gh.get_file_contents(repo, filepath, head_sha)
+
+        return file_reader
 
     # ── Fast mode: one sample call, structured output, no tools ──────────
 
@@ -167,18 +288,10 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
         assert ctx is not None
-        from fastmcp_pr_review.fast import fast_review
+        from fastmcp_pr_review.fast import FastReview
 
-        project_ctx, issues = await _gather_context(repo, pr_number)
-        return await fast_review(
-            gh,
-            ctx,
-            repo,
-            pr_number,
-            focus_areas=focus_areas,
-            project_context=project_ctx,
-            linked_issues=issues,
-        )
+        inp = await _build_review_input(repo, pr_number, focus_areas=focus_areas)
+        return await FastReview().run(ctx, inp)
 
     # ── Thorough mode: multi-pass pipeline ────────────────────────────────
 
@@ -204,19 +317,56 @@ def create_server(
             intensity: Review depth — conservative, balanced, aggressive
         """
         assert ctx is not None
-        from fastmcp_pr_review.thorough import thorough_review
+        from fastmcp_pr_review.thorough import ThoroughReview
 
-        project_ctx, issues = await _gather_context(repo, pr_number)
-        return await thorough_review(
-            gh,
-            ctx,
-            repo,
-            pr_number,
-            project_context=project_ctx,
-            linked_issues=issues,
-            focus_areas=focus_areas,
-            intensity=intensity,
+        inp, head_sha = await _build_thorough_review_input(
+            repo, pr_number, focus_areas=focus_areas,
         )
+        file_reader = _make_pr_file_reader(repo, head_sha)
+        pipeline = ThoroughReview(intensity=intensity)
+        return await pipeline.run(ctx, inp, file_reader)
+
+    # ── Diff review: review a raw unified diff ────────────────────────────
+
+    @mcp.tool
+    async def review_diff_fast(
+        diff: str,
+        repo: str | None = None,
+        title: str = "Diff review",
+        description: str = "",
+        focus_areas: str | None = None,
+        ctx: Context | None = None,
+    ) -> PRReviewResult:
+        """Review a raw unified diff (not tied to a PR).
+
+        Accepts a unified diff string and reviews it using the fast
+        single-shot pipeline. Optionally provide a repo for project
+        context (README, AGENTS.md, etc.).
+
+        Args:
+            diff: Raw unified diff text
+            repo: Optional 'owner/repo' for project context
+            title: Label for the review (default: 'Diff review')
+            description: Description or context for the diff
+            focus_areas: Optional areas to focus on (e.g. 'security')
+        """
+        assert ctx is not None
+        from fastmcp_pr_review.fast import FastReview
+
+        files = _parse_diff_to_files(diff)
+
+        project_ctx = ""
+        if repo:
+            project_ctx = await gather_project_context(gh, repo, "HEAD")
+
+        inp = ReviewInput(
+            files=files,
+            title=title,
+            description=description,
+            project_context=project_ctx,
+            focus_areas=focus_areas,
+        )
+        return await FastReview().run(ctx, inp)
 
     return mcp
 

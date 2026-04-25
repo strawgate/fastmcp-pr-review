@@ -1,40 +1,20 @@
 """Tests for the fast single-shot review mode."""
 
-from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fastmcp_pr_review.fast import fast_review
+from fastmcp_pr_review.fast import FastReview
 from fastmcp_pr_review.models import (
-    PRAuthor,
-    PRDetails,
     PRFile,
     PRReviewResult,
-    PRState,
-    PRTimeline,
+    ReviewInput,
     ReviewState,
 )
 
-# Note: tests call fast_review() directly with project_context=""
-# and linked_issues=[] as defaults — no mocking needed.
 
-
-def _make_timeline() -> PRTimeline:
-    return PRTimeline(
-        pr=PRDetails(
-            number=1,
-            title="Test",
-            state=PRState.OPEN,
-            author=PRAuthor(login="dev"),
-            head_ref="feat",
-            base_ref="main",
-            head_sha="abc",
-            created_at=datetime(2025, 1, 1, tzinfo=UTC),
-            updated_at=datetime(2025, 1, 1, tzinfo=UTC),
-            html_url="https://github.com/owner/repo/pull/1",
-        ),
-        events=[],
+def _make_inp(**overrides: object) -> ReviewInput:
+    defaults = dict(
         files=[
             PRFile(
                 filename="src/main.py",
@@ -45,7 +25,17 @@ def _make_timeline() -> PRTimeline:
                 patch="+new\n-old",
             )
         ],
+        title="Test",
+        description="",
+        author="dev",
+        head_ref="feat",
+        base_ref="main",
+        additions=10,
+        deletions=5,
+        changed_files=1,
     )
+    defaults.update(overrides)  # ty: ignore[no-matching-overload]
+    return ReviewInput(**defaults)  # ty: ignore[invalid-argument-type]
 
 
 def _make_result() -> PRReviewResult:
@@ -63,10 +53,9 @@ class TestFastReview:
         """Fast mode makes exactly one ctx.sample() call with no tools."""
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
 
-        result = await fast_review(gh, ctx, "owner/repo", 1)
+        pipeline = FastReview()
+        result = await pipeline.run(ctx, _make_inp())
 
         assert result.verdict == ReviewState.APPROVED
         ctx.sample.assert_awaited_once()
@@ -75,26 +64,12 @@ class TestFastReview:
         assert "tools" not in call_kwargs
 
     @pytest.mark.asyncio
-    async def test_does_not_call_get_diff(self) -> None:
-        """Fast mode uses timeline file patches, never calls get_diff separately."""
-        ctx = MagicMock()
-        ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_diff = AsyncMock()
-
-        await fast_review(gh, ctx, "owner/repo", 1)
-
-        gh.get_diff.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_includes_focus_areas(self) -> None:
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
 
-        await fast_review(gh, ctx, "owner/repo", 1, focus_areas="security")
+        pipeline = FastReview()
+        await pipeline.run(ctx, _make_inp(focus_areas="security"))
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "security" in messages
@@ -103,10 +78,9 @@ class TestFastReview:
     async def test_includes_diff_in_prompt(self) -> None:
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
 
-        await fast_review(gh, ctx, "owner/repo", 1)
+        pipeline = FastReview()
+        await pipeline.run(ctx, _make_inp())
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "src/main.py" in messages
@@ -114,23 +88,39 @@ class TestFastReview:
     @pytest.mark.asyncio
     async def test_handles_no_patches(self) -> None:
         """When files have no patches, prompt shows a fallback message."""
-        timeline = _make_timeline()
-        timeline.files = [
-            PRFile(
-                filename="binary.png",
-                status="modified",
-                additions=0,
-                deletions=0,
-                changes=0,
-                patch=None,
-            )
-        ]
         ctx = MagicMock()
         ctx.sample = AsyncMock(return_value=MagicMock(result=_make_result()))
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=timeline)
 
-        await fast_review(gh, ctx, "owner/repo", 1)
+        inp = _make_inp(
+            files=[
+                PRFile(
+                    filename="binary.png",
+                    status="modified",
+                    additions=0,
+                    deletions=0,
+                    changes=0,
+                    patch=None,
+                )
+            ]
+        )
+        pipeline = FastReview()
+        await pipeline.run(ctx, inp)
 
         messages = ctx.sample.call_args.kwargs["messages"]
         assert "(no patches available)" in messages
+
+    def test_build_prompt_returns_string(self) -> None:
+        """build_prompt() should return a string with key fields."""
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp())
+        assert "Test" in prompt
+        assert "src/main.py" in prompt
+
+    def test_subclass_overrides_system_prompt(self) -> None:
+        """Subclassing should allow overriding SYSTEM_PROMPT."""
+
+        class SecurityReview(FastReview):
+            SYSTEM_PROMPT = "You are a security auditor."
+
+        pipeline = SecurityReview()
+        assert pipeline.SYSTEM_PROMPT == "You are a security auditor."

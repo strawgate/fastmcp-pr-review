@@ -1,4 +1,4 @@
-"""Fast single-shot PR review.
+"""Fast single-shot review — one ctx.sample() call, structured output, no tools.
 
 Demonstrates the leanest FastMCP sampling pattern:
   - One ctx.sample() call
@@ -6,24 +6,38 @@ Demonstrates the leanest FastMCP sampling pattern:
   - No tool calling
 
 The LLM receives the full diff in one prompt and returns a structured
-PRReviewResult with verdict, comments, and scores -- all validated
+PRReviewResult with verdict, comments, and scores — all validated
 against the Pydantic schema automatically by FastMCP.
+
+To customize, subclass ``FastReview`` and override ``SYSTEM_PROMPT``
+and/or ``build_prompt()``.
 """
 
 import logging
 
 from fastmcp import Context
 
-from fastmcp_pr_review.github_client import GitHubPRClient
-from fastmcp_pr_review.models import PRReviewResult
+from fastmcp_pr_review.models import PRReviewResult, ReviewInput
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Prompt -- inlined so you can read the full example in one file
-# ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """\
+# ═══════════════════════════════════════════════════════════════════════════
+# FastReview pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class FastReview:
+    """Single-shot review pipeline — one LLM call, structured output.
+
+    Override ``SYSTEM_PROMPT`` for domain-specific review focus.
+    Override ``build_prompt()`` for custom prompt formatting.
+    Override ``run()`` for a completely different flow.
+    """
+
+    # -- Prompt (class attribute — override in subclasses) ------------------
+
+    SYSTEM_PROMPT = """\
 You are an expert code reviewer. Analyze the pull request diff and context.
 
 Focus on these categories, in priority order:
@@ -65,93 +79,82 @@ Be specific. Reference file paths and line numbers.
 Explain *why* each issue matters and suggest a fix when possible.
 Finding no issues is a valid outcome -- do not invent problems."""
 
+    # -- Methods -----------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Review function
-# ---------------------------------------------------------------------------
+    def build_prompt(self, inp: ReviewInput) -> str:
+        """Build the user prompt from a ReviewInput. Override for custom format."""
+        patches = "\n\n".join(
+            f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```"
+            for f in inp.files
+            if f.patch
+        )
+        diff_context = patches or "(no patches available)"
 
+        context_section = ""
+        if inp.project_context:
+            context_section = f"\n### Project Context\n{inp.project_context}\n"
+        if inp.linked_issues:
+            issues_text = "\n\n".join(inp.linked_issues)
+            context_section += f"\n### Linked Issues\n{issues_text}\n"
 
-async def fast_review(
-    gh: GitHubPRClient,
-    ctx: Context,
-    repo: str,
-    pr_number: int,
-    *,
-    focus_areas: str | None = None,
-    project_context: str = "",
-    linked_issues: list[str] | None = None,
-) -> PRReviewResult:
-    """Review a PR with a single LLM call. No tools, just structured output.
+        header_parts = [f"## Review: {inp.title}"]
+        if inp.author:
+            header_parts.append(f"Author: @{inp.author}")
+        if inp.head_ref and inp.base_ref:
+            header_parts.append(f"{inp.head_ref} -> {inp.base_ref}")
+        elif inp.head_ref:
+            header_parts.append(inp.head_ref)
+        if inp.additions or inp.deletions or inp.changed_files:
+            header_parts.append(
+                f"Stats: +{inp.additions} -{inp.deletions} "
+                f"across {inp.changed_files} files"
+            )
 
-    This is the simplest possible FastMCP sampling pattern:
-    1. Build a prompt with the full diff
-    2. Call ctx.sample() with result_type=PRReviewResult
-    3. FastMCP ensures the response matches the Pydantic schema
+        prompt = (
+            f"{header_parts[0]}\n"
+            + " | ".join(header_parts[1:])
+            + f"\n\n### Description\n{inp.description or '(no description)'}\n"
+            f"{context_section}\n"
+            f"### Diff\n{diff_context}\n\n"
+            "Review this code and provide your structured assessment."
+        )
 
-    Args:
-        project_context: Pre-fetched project docs (README, AGENTS.md, etc.)
-        linked_issues: Pre-fetched linked issue summaries
-    """
-    logger.info("fast: reviewing %s#%d", repo, pr_number)
+        if inp.focus_areas:
+            prompt += f"\n\nFocus especially on: {inp.focus_areas}"
 
-    timeline = await gh.get_timeline(repo, pr_number)
-    pr = timeline.pr
+        return prompt
 
-    # Build the prompt
-    patches = "\n\n".join(
-        f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```" for f in timeline.files if f.patch
-    )
-    diff_context = patches or "(no patches available)"
+    async def run(self, ctx: Context, inp: ReviewInput) -> PRReviewResult:
+        """Execute the review — one ctx.sample() call with structured output.
 
-    # Inject project context and linked issues into the prompt
-    context_section = ""
-    if project_context:
-        context_section = f"\n### Project Context\n{project_context}\n"
-    if linked_issues:
-        issues_text = "\n\n".join(linked_issues)
-        context_section += f"\n### Linked Issues\n{issues_text}\n"
+        Override for a completely custom flow while keeping the class
+        interface consistent.
+        """
+        prompt = self.build_prompt(inp)
 
-    user_prompt = (
-        f"## Pull Request: {pr.title} (#{pr.number})\n"
-        f"Author: @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
-        f"Stats: +{pr.additions} -{pr.deletions} "
-        f"across {pr.changed_files} files\n\n"
-        f"### Description\n{pr.body or '(no description)'}\n"
-        f"{context_section}\n"
-        f"### Diff\n{diff_context}\n\n"
-        "Review this PR and provide your structured assessment."
-    )
+        n_files = len([f for f in inp.files if f.patch])
+        logger.info("fast: sampling — %d files, %d chars prompt", n_files, len(prompt))
 
-    if focus_areas:
-        user_prompt += f"\n\nFocus especially on: {focus_areas}"
+        # -------------------------------------------------------------------
+        # THE INTERESTING PART: one ctx.sample() call with structured output
+        # -------------------------------------------------------------------
+        # result_type=PRReviewResult tells FastMCP to:
+        #   1. Create a hidden "final_response" tool from the Pydantic schema
+        #   2. Have the LLM call that tool with structured JSON
+        #   3. Validate the response against the model
+        #   4. Return it as result.result (a PRReviewResult instance)
+        result = await ctx.sample(
+            messages=prompt,
+            system_prompt=self.SYSTEM_PROMPT,
+            result_type=PRReviewResult,
+            temperature=0.2,
+            max_tokens=16384,
+        )
 
-    n_files = len([f for f in timeline.files if f.patch])
-    logger.info(
-        "fast: sampling — %d files, %d chars prompt",
-        n_files,
-        len(user_prompt),
-    )
-
-    # -----------------------------------------------------------------------
-    # THE INTERESTING PART: one ctx.sample() call with structured output
-    # -----------------------------------------------------------------------
-    # result_type=PRReviewResult tells FastMCP to:
-    #   1. Create a hidden "final_response" tool from the Pydantic schema
-    #   2. Have the LLM call that tool with structured JSON
-    #   3. Validate the response against the model
-    #   4. Return it as result.result (a PRReviewResult instance)
-    result = await ctx.sample(
-        messages=user_prompt,
-        system_prompt=SYSTEM_PROMPT,
-        result_type=PRReviewResult,
-        temperature=0.2,
-        max_tokens=16384,
-    )
-
-    review = result.result
-    logger.info(
-        "fast: done — %s, %d comments",
-        review.verdict,
-        len(review.comments),
-    )
-    return review
+        review = result.result
+        logger.info(
+            "fast: done — %s, %d comments",
+            review.verdict,
+            len(review.comments),
+        )
+        return review
