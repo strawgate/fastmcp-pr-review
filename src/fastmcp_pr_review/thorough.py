@@ -47,7 +47,6 @@ if TYPE_CHECKING:
 
     from fastmcp import Context
 
-    from fastmcp_pr_review.github_client import GitHubPRClient
     from fastmcp_pr_review.models import PRFile
 
 logger = logging.getLogger(__name__)
@@ -793,60 +792,3 @@ Rules:
             files_prefiltered + files_filtered,
         )
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Backwards-compatible wrapper
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-async def thorough_review(
-    gh: GitHubPRClient,
-    ctx: Context,
-    repo: str,
-    pr_number: int,
-    *,
-    focus_areas: str | None = None,
-    intensity: str = "balanced",
-    max_files: int = 50,
-    filter_batch_size: int = 10,
-    concurrency: int = 3,
-    min_confidence: int = 50,
-    project_context: str = "",
-    linked_issues: list[str] | None = None,
-) -> PRReviewResult:
-    """Backwards-compatible wrapper — builds ReviewInput from PR data."""
-    timeline, comments_by_file, prior_reviews = await asyncio.gather(
-        gh.get_timeline(repo, pr_number),
-        gh.get_review_comments_by_file(repo, pr_number),
-        gh.get_prior_review_bodies(repo, pr_number),
-    )
-    pr = timeline.pr
-
-    inp = ReviewInput(
-        files=timeline.files,
-        title=pr.title,
-        description=pr.body or "",
-        author=pr.author.login,
-        head_ref=pr.head_ref,
-        base_ref=pr.base_ref,
-        additions=pr.additions,
-        deletions=pr.deletions,
-        changed_files=pr.changed_files,
-        project_context=project_context,
-        linked_issues=linked_issues or [],
-        focus_areas=focus_areas,
-        existing_threads=comments_by_file,
-        prior_reviews=prior_reviews,
-    )
-
-    async def file_reader(filepath: str) -> str:
-        return await gh.get_file_contents(repo, filepath, pr.head_sha)
-
-    pipeline = ThoroughReview(
-        intensity=intensity,
-        concurrency=concurrency,
-        max_files=max_files,
-        filter_batch_size=filter_batch_size,
-        min_confidence=min_confidence,
-    )
-    return await pipeline.run(ctx, inp, file_reader)

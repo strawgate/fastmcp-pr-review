@@ -26,7 +26,6 @@ from fastmcp_pr_review.thorough import (
     ReviewDone,
     ThoroughReview,
     VerifyComplete,
-    thorough_review,
 )
 
 
@@ -282,13 +281,9 @@ class TestFullPipeline:
             ]
         )
 
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_review_comments_by_file = AsyncMock(return_value={})
-        gh.get_prior_review_bodies = AsyncMock(return_value=[])
-        gh.get_file_contents = AsyncMock(return_value="contents")
-
-        result = await thorough_review(gh, ctx, "o/r", 1)
+        inp = _make_inp()
+        pipeline = ThoroughReview()
+        result = await pipeline.run(ctx, inp, _noop_file_reader)
 
         # filter (1 batch) + review (1 batch) = 2 calls
         # verify skipped because review found no findings
@@ -308,12 +303,9 @@ class TestFullPipeline:
             return_value=MagicMock(result=filter_result),
         )
 
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_review_comments_by_file = AsyncMock(return_value={})
-        gh.get_prior_review_bodies = AsyncMock(return_value=[])
-
-        result = await thorough_review(gh, ctx, "o/r", 1)
+        inp = _make_inp()
+        pipeline = ThoroughReview()
+        result = await pipeline.run(ctx, inp, _noop_file_reader)
 
         # Only 1 call: the filter. No review or verify calls needed.
         assert ctx.sample.await_count == 1
