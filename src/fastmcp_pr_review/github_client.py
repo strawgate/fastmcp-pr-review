@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import logging
 
 from githubkit import GitHub
+from githubkit.utils import UNSET
 
 from fastmcp_pr_review.models import (
     PRAuthor,
@@ -20,6 +23,8 @@ from fastmcp_pr_review.models import (
     TimelineEvent,
     TimelineEventType,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_owner_repo(repo: str) -> tuple[str, str]:
@@ -169,7 +174,7 @@ class GitHubPRClient:
                     additions=f.additions,
                     deletions=f.deletions,
                     changes=f.changes,
-                    patch=f.patch if hasattr(f, "patch") else None,
+                    patch=getattr(f, "patch", None),
                 )
             )
         return files
@@ -275,12 +280,13 @@ class GitHubPRClient:
         reviews = await self.get_reviews(repo, pr_number)
         return [r.body for r in reviews if r.body]
 
-    async def get_file_contents(self, repo: str, filepath: str, ref: str | None = None) -> str:
-        """Get file contents at a specific git ref (defaults to repo's default branch)."""
-        import base64
+    async def get_file_contents(
+        self, repo: str, filepath: str, ref: str | None = None,
+    ) -> str | None:
+        """Get file contents at a specific git ref (defaults to repo's default branch).
 
-        from githubkit.utils import UNSET
-
+        Returns ``None`` when the file cannot be read (missing, binary, error).
+        """
         owner, repo_name = _parse_owner_repo(repo)
         try:
             resp = await self._github.rest.repos.async_get_content(
@@ -290,6 +296,22 @@ class GitHubPRClient:
             content = getattr(data, "content", None)
             if isinstance(content, str):
                 return base64.b64decode(content).decode("utf-8")
-            return ""
+            return None
         except Exception:
-            return f"(unable to read {filepath})"
+            logger.debug("Unable to read %s at ref=%s", filepath, ref)
+            return None
+
+    async def get_issue(self, repo: str, issue_number: int) -> tuple[str, str, str] | None:
+        """Get issue title, state, and body (truncated).
+
+        Returns ``(title, state, body)`` or ``None`` on error.
+        """
+        owner, repo_name = _parse_owner_repo(repo)
+        try:
+            resp = await self._github.rest.issues.async_get(owner, repo_name, issue_number)
+            issue = resp.parsed_data
+            body = (issue.body or "")[:500]
+            return (issue.title, str(issue.state), body)
+        except Exception:
+            logger.debug("Unable to fetch issue #%d from %s", issue_number, repo)
+            return None

@@ -1,10 +1,5 @@
 """Fast single-shot review — one ctx.sample() call, structured output, no tools.
 
-Demonstrates the leanest FastMCP sampling pattern:
-  - One ctx.sample() call
-  - Structured output via result_type (Pydantic model)
-  - No tool calling
-
 The LLM receives the full diff in one prompt and returns a structured
 PRReviewResult with verdict, comments, and scores — all validated
 against the Pydantic schema automatically by FastMCP.
@@ -13,9 +8,13 @@ To customize, subclass ``FastReview`` and override ``SYSTEM_PROMPT``
 and/or ``build_prompt()``.
 """
 
-import logging
+from __future__ import annotations
 
-from fastmcp import Context
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fastmcp import Context
 
 from fastmcp_pr_review.models import PRReviewResult, ReviewInput
 
@@ -137,14 +136,6 @@ Finding no issues is a valid outcome -- do not invent problems."""
         n_files = len([f for f in inp.files if f.patch])
         logger.info("fast: sampling — %d files, %d chars prompt", n_files, len(prompt))
 
-        # -------------------------------------------------------------------
-        # THE INTERESTING PART: one ctx.sample() call with structured output
-        # -------------------------------------------------------------------
-        # result_type=PRReviewResult tells FastMCP to:
-        #   1. Create a hidden "final_response" tool from the Pydantic schema
-        #   2. Have the LLM call that tool with structured JSON
-        #   3. Validate the response against the model
-        #   4. Return it as result.result (a PRReviewResult instance)
         result = await ctx.sample(
             messages=prompt,
             system_prompt=self.SYSTEM_PROMPT,

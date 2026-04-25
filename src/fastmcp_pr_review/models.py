@@ -1,18 +1,17 @@
 """Shared Pydantic models for PR data, review output, and scoring.
 
-The fast and thorough review modules define their own stage-specific
-models inline so each mode stays self-contained. This module contains
-only the types shared across both modes, plus the source-agnostic
-``ReviewInput`` / ``FileReader`` abstractions that decouple review
-logic from data sources.
+The thorough review module defines its own stage-specific models inline
+so it stays self-contained. This module contains only the types shared
+across both modes, plus the source-agnostic ``ReviewInput`` /
+``FileReader`` abstractions that decouple review logic from data sources.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime  # noqa: TC003
+from datetime import datetime  # noqa: TC003 — Pydantic needs this at runtime
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from pydantic import BaseModel, Field
 
@@ -134,7 +133,6 @@ class PRTimeline(BaseModel):
 # ── Source-agnostic review abstractions ────────────────────────────────────
 
 
-@runtime_checkable
 class FileReader(Protocol):
     """Reads a file's contents — implementation varies by data source.
 
@@ -173,7 +171,7 @@ class ReviewInput:
     prior_reviews: list[str] = field(default_factory=list)
 
 
-# ── Review Output (shared by all three v* implementations) ─────────────────
+# ── Review Output (shared by fast and thorough pipelines) ──────────────────
 
 
 class Severity(StrEnum):
@@ -218,7 +216,7 @@ class ReviewStats(BaseModel):
 
 
 class PRReviewResult(BaseModel):
-    """Final output of any review pipeline. All three versions produce this."""
+    """Final output of any review pipeline."""
 
     verdict: ReviewState = Field(
         description="Overall verdict: APPROVED, CHANGES_REQUESTED, or COMMENTED"

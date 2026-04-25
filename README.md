@@ -17,7 +17,7 @@ One `ctx.sample()` call with `result_type=PRReviewResult`. Sends the full diff, 
 
 ### Thorough
 
-Four-pass pipeline with batched file filtering, per-file review with a verification protocol, and agentic verification where the LLM explores the repo to confirm or disprove findings. Configurable intensity (conservative/balanced/aggressive). Only confirmed findings survive.
+Multi-pass pipeline with batched file filtering, per-file review with a verification protocol, and agentic verification where the LLM explores the repo to confirm or disprove findings. Configurable intensity (conservative/balanced/aggressive). Only confirmed findings survive.
 
 ## Quick Start
 

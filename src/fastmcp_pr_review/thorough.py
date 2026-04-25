@@ -1,10 +1,11 @@
 """Thorough class-based review pipeline.
 
-A multi-pass review system demonstrating advanced FastMCP patterns:
+A multi-pass review system:
 
-  Pass 2 — Filter: Batch-classify files as skip/review (structured output)
-  Pass 3 — Review: Batched review with tool-based finding collection
-  Pass 4 — Verify: Single agentic call to confirm/disprove findings
+  Pass 1 — Prefilter: Skip binary/generated files (sync, pattern-based)
+  Pass 2 — Filter:    Batch-classify files as skip/review (structured output)
+  Pass 3 — Review:    Batched review with tool-based finding collection
+  Pass 4 — Verify:    Single agentic call to confirm/disprove findings
 
 The ``ThoroughReview`` class decouples the pipeline from data sources.
 Callers build a ``ReviewInput`` and supply a ``FileReader`` — the same
@@ -456,8 +457,9 @@ Rules:
         for br in results:
             for fc in br.chunks:
                 if fc.skip:
-                    skipped = chunk_by_idx.get(fc.index, fc.index)
-                    logger.debug("thorough: filter skipped %s — %s", skipped, fc.reason)
+                    chunk = chunk_by_idx.get(fc.index)
+                    name = chunk.filename if chunk else f"index={fc.index}"
+                    logger.debug("thorough: filter skipped %s — %s", name, fc.reason)
                     continue
                 chunk = chunk_by_idx.get(fc.index)
                 if chunk:
@@ -770,20 +772,20 @@ Rules:
     ) -> PRReviewResult:
         total_files = len(inp.files)
 
-        # Pre-filter: skip binary/generated files
+        # Pass 1: Prefilter (sync — skip binary/generated files)
         chunks = self.prefilter(inp.files)
         files_prefiltered = total_files - len(chunks)
 
-        # Pass 2: Filter
+        # Pass 2: Filter (LLM classifies files as skip/review)
         with logfire.span("pass 2: filter", files=len(chunks)):
             reviewables = await self.filter_files(ctx, chunks, inp)
             files_filtered = len(chunks) - len(reviewables)
 
-        # Pass 3: Review
+        # Pass 3: Review (batched review with tool-based finding collection)
         with logfire.span("pass 3: review", files=len(reviewables)):
             all_findings = await self.review_files(ctx, reviewables, inp, file_reader)
 
-        # Pass 4: Verify
+        # Pass 4: Verify (agentic exploration to confirm/disprove)
         with logfire.span("pass 4: verify", findings=len(all_findings)):
             confirmed = await self.verify_findings(ctx, all_findings, inp, file_reader)
 

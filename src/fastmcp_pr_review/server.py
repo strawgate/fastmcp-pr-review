@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import re
 from typing import TYPE_CHECKING
 
 import click
@@ -10,8 +12,10 @@ import logfire
 from fastmcp import Context, FastMCP
 
 from fastmcp_pr_review.context import extract_linked_issues, gather_project_context
+from fastmcp_pr_review.fast import FastReview
 from fastmcp_pr_review.github_client import GitHubPRClient
 from fastmcp_pr_review.models import (
+    FileReader,
     PRFile,
     PRReviewResult,
     PRTimeline,
@@ -19,6 +23,7 @@ from fastmcp_pr_review.models import (
     TimelineEvent,
     TimelineEventType,
 )
+from fastmcp_pr_review.thorough import ThoroughReview
 
 if TYPE_CHECKING:
     from fastmcp.client.sampling import SamplingHandler
@@ -77,8 +82,6 @@ def _parse_diff_to_files(diff: str) -> list[PRFile]:
     Simple parser — handles standard ``diff --git`` and ``---/+++`` headers.
     Each file gets the raw patch text; line counts are best-effort.
     """
-    import re
-
     files: list[PRFile] = []
     # Split on diff headers
     parts = re.split(r"^diff --git ", diff, flags=re.MULTILINE)
@@ -146,10 +149,15 @@ def create_server(
     mcp = FastMCP(
         name="pr-review",
         instructions=(
-            "GitHub code review server with three review tools:\n"
+            "GitHub code review server.\n\n"
+            "Review tools:\n"
             "- review_pr_fast: Quick single-shot PR review (one LLM call)\n"
             "- review_pr_thorough: Multi-pass PR pipeline (filter + review + verify)\n"
-            "- review_diff_fast: Review a raw unified diff (not tied to a PR)"
+            "- review_diff_fast: Review a raw unified diff (not tied to a PR)\n\n"
+            "Data tools:\n"
+            "- get_pr_info: PR timeline (events, comments, reviews)\n"
+            "- get_pr_diff: Raw diff text\n"
+            "- get_pr_files: List of changed files with stats"
         ),
         sampling_handler=handler,
         sampling_handler_behavior="fallback",
@@ -197,8 +205,6 @@ def create_server(
         focus_areas: str | None = None,
     ) -> ReviewInput:
         """Build a ReviewInput from PR data — fetches timeline, project docs, linked issues."""
-        import asyncio
-
         timeline = await gh.get_timeline(repo, pr_number)
         pr = timeline.pr
         project_ctx, issues = await asyncio.gather(
@@ -231,8 +237,6 @@ def create_server(
 
         Returns (ReviewInput, head_sha) so the caller can build a FileReader.
         """
-        import asyncio
-
         timeline, comments_by_file, prior_reviews = await asyncio.gather(
             gh.get_timeline(repo, pr_number),
             gh.get_review_comments_by_file(repo, pr_number),
@@ -262,11 +266,11 @@ def create_server(
         )
         return inp, pr.head_sha
 
-    def _make_pr_file_reader(repo: str, head_sha: str):
+    def _make_pr_file_reader(repo: str, head_sha: str) -> FileReader:
         """Create a FileReader that reads files from a PR's head ref."""
 
         async def file_reader(filepath: str) -> str:
-            return await gh.get_file_contents(repo, filepath, head_sha)
+            return await gh.get_file_contents(repo, filepath, head_sha) or ""
 
         return file_reader
 
@@ -290,8 +294,6 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
         assert ctx is not None
-        from fastmcp_pr_review.fast import FastReview
-
         inp = await _build_review_input(repo, pr_number, focus_areas=focus_areas)
         return await FastReview().run(ctx, inp)
 
@@ -319,8 +321,6 @@ def create_server(
             intensity: Review depth — conservative, balanced, aggressive
         """
         assert ctx is not None
-        from fastmcp_pr_review.thorough import ThoroughReview
-
         inp, head_sha = await _build_thorough_review_input(
             repo, pr_number, focus_areas=focus_areas,
         )
@@ -353,8 +353,6 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
         assert ctx is not None
-        from fastmcp_pr_review.fast import FastReview
-
         files = _parse_diff_to_files(diff)
 
         project_ctx = ""
