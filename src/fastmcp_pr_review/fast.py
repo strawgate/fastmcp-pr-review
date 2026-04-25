@@ -98,6 +98,8 @@ Finding no issues is a valid outcome -- do not invent problems."""
             context_section += f"\n### Linked Issues\n{issues_text}\n"
 
         header_parts = [f"## Review: {inp.title}"]
+        if inp.pr_number is not None:
+            header_parts.append(f"PR #{inp.pr_number}")
         if inp.author:
             header_parts.append(f"Author: @{inp.author}")
         if inp.head_ref and inp.base_ref:

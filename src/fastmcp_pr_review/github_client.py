@@ -275,14 +275,16 @@ class GitHubPRClient:
         reviews = await self.get_reviews(repo, pr_number)
         return [r.body for r in reviews if r.body]
 
-    async def get_file_contents(self, repo: str, filepath: str, ref: str) -> str:
-        """Get file contents at a specific git ref."""
+    async def get_file_contents(self, repo: str, filepath: str, ref: str | None = None) -> str:
+        """Get file contents at a specific git ref (defaults to repo's default branch)."""
         import base64
+
+        from githubkit.utils import UNSET
 
         owner, repo_name = _parse_owner_repo(repo)
         try:
             resp = await self._github.rest.repos.async_get_content(
-                owner, repo_name, filepath, ref=ref
+                owner, repo_name, filepath, ref=ref if ref else UNSET
             )
             data = resp.parsed_data
             content = getattr(data, "content", None)

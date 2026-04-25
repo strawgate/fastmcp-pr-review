@@ -159,6 +159,7 @@ class ReviewInput:
     title: str
     description: str = ""
     author: str = ""
+    pr_number: int | None = None
     head_ref: str = ""
     base_ref: str = ""
     additions: int = 0

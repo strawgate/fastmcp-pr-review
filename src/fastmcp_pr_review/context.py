@@ -39,7 +39,7 @@ _ISSUE_REF_PATTERN = re.compile(
 async def gather_project_context(
     gh: GitHubPRClient,
     repo: str,
-    ref: str,
+    ref: str | None = None,
 ) -> str:
     """Read well-known project docs to understand the codebase.
 

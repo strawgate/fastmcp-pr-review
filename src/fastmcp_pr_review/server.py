@@ -210,6 +210,7 @@ def create_server(
             title=pr.title,
             description=pr.body or "",
             author=pr.author.login,
+            pr_number=pr_number,
             head_ref=pr.head_ref,
             base_ref=pr.base_ref,
             additions=pr.additions,
@@ -247,6 +248,7 @@ def create_server(
             title=pr.title,
             description=pr.body or "",
             author=pr.author.login,
+            pr_number=pr_number,
             head_ref=pr.head_ref,
             base_ref=pr.base_ref,
             additions=pr.additions,
@@ -357,7 +359,7 @@ def create_server(
 
         project_ctx = ""
         if repo:
-            project_ctx = await gather_project_context(gh, repo, "HEAD")
+            project_ctx = await gather_project_context(gh, repo)
 
         inp = ReviewInput(
             files=files,
