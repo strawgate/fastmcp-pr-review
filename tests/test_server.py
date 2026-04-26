@@ -21,8 +21,12 @@ from fastmcp_pr_review.models import (
 )
 from fastmcp_pr_review.server import (
     _build_review_context_from_events,
+    _build_review_input,
+    _build_thorough_review_input,
+    _fetch_pr_context,
     _format_timeline,
     _format_timeline_event,
+    _make_pr_file_reader,
     _parse_diff_to_files,
     cli,
     create_server,
@@ -411,3 +415,188 @@ class TestBuildReviewContextFromEvents:
         threads, reviews = _build_review_context_from_events(events)
         assert list(threads.keys()) == ["a.py", "b.py"]
         assert reviews == ["First pass.", "Second pass."]
+
+
+class TestFetchPrContext:
+    """Tests for _fetch_pr_context (now module-level, gh-injected)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_timeline_project_context_and_issues(
+        self,
+        pr_timeline: PRTimeline,
+    ) -> None:
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=pr_timeline)
+
+        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
+            "fastmcp_pr_review.server.extract_linked_issues"
+        ) as mock_eli:
+            mock_gpc.return_value = "Project context text."
+            mock_eli.return_value = ["Fixes #123"]
+
+            timeline, project_ctx, issues = await _fetch_pr_context(gh, "owner/repo", 42)
+
+        assert timeline is pr_timeline
+        assert project_ctx == "Project context text."
+        assert issues == ["Fixes #123"]
+        gh.get_timeline.assert_awaited_once_with("owner/repo", 42)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fetches(self, pr_timeline: PRTimeline) -> None:
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=pr_timeline)
+
+        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
+            "fastmcp_pr_review.server.extract_linked_issues"
+        ) as mock_eli:
+            mock_gpc.return_value = ""
+            mock_eli.return_value = []
+
+            await _fetch_pr_context(gh, "owner/repo", 42)
+
+            mock_gpc.assert_called_once()
+            mock_eli.assert_called_once()
+
+
+class TestBuildReviewInput:
+    """Tests for _build_review_input (now module-level, gh-injected)."""
+
+    @pytest.mark.asyncio
+    async def test_builds_input_from_timeline(
+        self,
+        pr_details: PRDetails,
+        pr_timeline: PRTimeline,
+    ) -> None:
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=pr_timeline)
+
+        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
+            "fastmcp_pr_review.server.extract_linked_issues"
+        ) as mock_eli:
+            mock_gpc.return_value = "Project context."
+            mock_eli.return_value = []
+
+            inp = await _build_review_input(gh, "owner/repo", 42)
+
+        assert inp.title == pr_details.title
+        assert inp.author == pr_details.author.login
+        assert inp.pr_number == 42
+        assert inp.head_ref == pr_details.head_ref
+        assert inp.base_ref == pr_details.base_ref
+        assert inp.files == pr_timeline.files
+        assert inp.project_context == "Project context."
+        assert inp.focus_areas is None
+
+    @pytest.mark.asyncio
+    async def test_passes_focus_areas(self, pr_timeline: PRTimeline) -> None:
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=pr_timeline)
+
+        with patch("fastmcp_pr_review.server.gather_project_context"), patch(
+            "fastmcp_pr_review.server.extract_linked_issues"
+        ):
+            inp = await _build_review_input(
+                gh, "owner/repo", 42, focus_areas="security"
+            )
+
+        assert inp.focus_areas == "security"
+
+
+class TestBuildThoroughReviewInput:
+    """Tests for _build_thorough_review_input (now module-level, gh-injected)."""
+
+    @pytest.mark.asyncio
+    async def test_builds_input_with_threads_and_commits(
+        self,
+        pr_timeline: PRTimeline,
+    ) -> None:
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=pr_timeline)
+
+        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
+            "fastmcp_pr_review.server.extract_linked_issues"
+        ) as mock_eli:
+            mock_gpc.return_value = ""
+            mock_eli.return_value = []
+
+            inp, head_sha = await _build_thorough_review_input(
+                gh, "owner/repo", 42
+            )
+
+        assert inp.commits == pr_timeline.commits
+        assert "src/widget.py" in inp.existing_threads
+        assert head_sha == pr_timeline.pr.head_sha
+
+    @pytest.mark.asyncio
+    async def test_prior_reviews_extracted_from_events(
+        self,
+        pr_author: PRAuthor,
+    ) -> None:
+        events = [
+            TimelineEvent(
+                type=TimelineEventType.PR_OPENED,
+                timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+                author=pr_author,
+                body="PR body",
+            ),
+            TimelineEvent(
+                type=TimelineEventType.REVIEW,
+                timestamp=datetime(2025, 1, 2, tzinfo=UTC),
+                author=pr_author,
+                body="LGTM with nits.",
+                review_state=ReviewState.APPROVED,
+            ),
+        ]
+        timeline = PRTimeline(
+            pr=PRDetails(
+                number=1,
+                title="T",
+                state=PRState.OPEN,
+                author=pr_author,
+                head_ref="f",
+                base_ref="main",
+                head_sha="abc",
+                created_at=datetime(2025, 1, 1, tzinfo=UTC),
+                updated_at=datetime(2025, 1, 1, tzinfo=UTC),
+            ),
+            events=events,
+            files=[],
+            commits=[],
+        )
+        gh = MagicMock()
+        gh.get_timeline = AsyncMock(return_value=timeline)
+
+        with patch("fastmcp_pr_review.server.gather_project_context"), patch(
+            "fastmcp_pr_review.server.extract_linked_issues"
+        ):
+            inp, _ = await _build_thorough_review_input(gh, "owner/repo", 1)
+
+        assert inp.prior_reviews == ["LGTM with nits."]
+
+
+class TestMakePrFileReader:
+    """Tests for _make_pr_file_reader (now module-level, gh-injected)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_file_reader_that_delegates_to_gh(self) -> None:
+        gh = MagicMock()
+        gh.get_file_contents = AsyncMock(return_value="file contents")
+
+        reader = _make_pr_file_reader(gh, "owner/repo", "abc123")
+        result = await reader("src/main.py")
+
+        assert result == "file contents"
+        gh.get_file_contents.assert_awaited_once_with(
+            "owner/repo", "src/main.py", "abc123"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_string_on_none(self) -> None:
+        gh = MagicMock()
+        gh.get_file_contents = AsyncMock(return_value=None)
+
+        reader = _make_pr_file_reader(gh, "owner/repo", "abc123")
+        result = await reader("missing.py")
+
+        assert result == ""
+
