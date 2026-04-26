@@ -122,6 +122,7 @@ class TimelineEvent(BaseModel):
     path: str | None = None
     diff_hunk: str | None = None
     line: int | None = None
+    id: int | None = None
 
 
 class PRTimeline(BaseModel):

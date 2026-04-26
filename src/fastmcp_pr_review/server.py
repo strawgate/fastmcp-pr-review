@@ -41,7 +41,7 @@ def _build_review_context_from_events(
         if event.type == TimelineEventType.REVIEW_COMMENT and event.path:
             existing_threads.setdefault(event.path, []).append(
                 PRReviewComment(
-                    id=0,
+                    id=event.id or 0,
                     author=event.author,
                     body=event.body,
                     path=event.path,

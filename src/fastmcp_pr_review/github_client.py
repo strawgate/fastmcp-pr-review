@@ -264,6 +264,7 @@ class GitHubPRClient:
                     path=rc.path,
                     diff_hunk=rc.diff_hunk,
                     line=rc.line,
+                    id=rc.id,
                 )
             )
 
