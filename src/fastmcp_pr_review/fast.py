@@ -94,6 +94,15 @@ Finding no issues is a valid outcome -- do not invent problems."""
             issues_text = "\n\n".join(inp.linked_issues)
             context_section += f"\n### Linked Issues\n{issues_text}\n"
 
+        commits_section = ""
+        if inp.commits:
+            commit_msgs = [c.message.split("\n")[0] for c in inp.commits[:10]]
+            commits_section = f"\n### Commits ({len(inp.commits)} total)\n" + "\n".join(
+                f"- {msg}" for msg in commit_msgs
+            )
+            if len(inp.commits) > 10:
+                commits_section += f"\n... and {len(inp.commits) - 10} more"
+
         header_parts = [f"## Review: {inp.title}"]
         if inp.pr_number is not None:
             header_parts.append(f"PR #{inp.pr_number}")
@@ -112,7 +121,8 @@ Finding no issues is a valid outcome -- do not invent problems."""
             f"{header_parts[0]}\n"
             + " | ".join(header_parts[1:])
             + f"\n\n### Description\n{inp.description or '(no description)'}\n"
-            f"{context_section}\n"
+            f"{context_section}"
+            f"{commits_section}\n"
             f"### Diff\n{diff_context}\n\n"
             "Review this code and provide your structured assessment."
         )

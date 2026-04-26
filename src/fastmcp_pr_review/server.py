@@ -41,7 +41,7 @@ def _build_review_context_from_events(
         if event.type == TimelineEventType.REVIEW_COMMENT and event.path:
             existing_threads.setdefault(event.path, []).append(
                 PRReviewComment(
-                    id=0,
+                    id=event.id or 0,
                     author=event.author,
                     body=event.body,
                     path=event.path,
@@ -157,6 +157,216 @@ def _parse_diff_to_files(diff: str) -> list[PRFile]:
     return files
 
 
+async def _fetch_pr_context(
+    gh: GitHubPRClient,
+    repo: str,
+    pr_number: int,
+) -> tuple[PRTimeline, str, list[str]]:
+    """Fetch PR timeline, project docs, and linked issues.
+
+    Returns (timeline, project_context, linked_issues).
+    """
+    timeline = await gh.get_timeline(repo, pr_number)
+    pr = timeline.pr
+    project_ctx, issues = await asyncio.gather(
+        gather_project_context(gh, repo, pr.head_sha),
+        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+    )
+    return timeline, project_ctx, issues
+
+
+async def _build_review_input(
+    gh: GitHubPRClient,
+    repo: str,
+    pr_number: int,
+    *,
+    focus_areas: str | None = None,
+) -> ReviewInput:
+    """Build a ReviewInput from PR data — fetches timeline, project docs, linked issues."""
+    timeline, project_ctx, issues = await _fetch_pr_context(gh, repo, pr_number)
+    pr = timeline.pr
+    return ReviewInput(
+        files=timeline.files,
+        title=pr.title,
+        description=pr.body or "",
+        author=pr.author.login,
+        pr_number=pr_number,
+        head_ref=pr.head_ref,
+        base_ref=pr.base_ref,
+        additions=pr.additions,
+        deletions=pr.deletions,
+        changed_files=pr.changed_files,
+        project_context=project_ctx,
+        linked_issues=issues,
+        focus_areas=focus_areas,
+    )
+
+
+async def _build_thorough_review_input(
+    gh: GitHubPRClient,
+    repo: str,
+    pr_number: int,
+    *,
+    focus_areas: str | None = None,
+) -> tuple[ReviewInput, str]:
+    """Build ReviewInput with thorough-mode extras (threads, prior reviews, commits).
+
+    Derives existing_threads and prior_reviews from the timeline instead of
+    re-fetching — get_timeline() already has all the data.
+    """
+    timeline = await gh.get_timeline(repo, pr_number)
+    pr = timeline.pr
+    project_ctx, issues = await asyncio.gather(
+        gather_project_context(gh, repo, pr.head_sha),
+        extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+    )
+
+    existing_threads, prior_reviews = _build_review_context_from_events(timeline.events)
+
+    inp = ReviewInput(
+        files=timeline.files,
+        title=pr.title,
+        description=pr.body or "",
+        author=pr.author.login,
+        pr_number=pr_number,
+        head_ref=pr.head_ref,
+        base_ref=pr.base_ref,
+        additions=pr.additions,
+        deletions=pr.deletions,
+        changed_files=pr.changed_files,
+        project_context=project_ctx,
+        linked_issues=issues,
+        focus_areas=focus_areas,
+        existing_threads=existing_threads,
+        prior_reviews=prior_reviews,
+        commits=timeline.commits,
+    )
+    return inp, pr.head_sha
+
+
+def _make_pr_file_reader(
+    gh: GitHubPRClient,
+    repo: str,
+    head_sha: str,
+) -> FileReader:
+    """Create a FileReader that reads files from a PR's head ref."""
+
+    async def file_reader(filepath: str) -> str:
+        return await gh.get_file_contents(repo, filepath, head_sha) or ""
+
+    return file_reader
+
+
+def _register_data_tools(mcp: FastMCP, gh: GitHubPRClient) -> None:
+    """Register get_pr_info, get_pr_diff, get_pr_files tools."""
+
+    @mcp.tool
+    async def get_pr_info(repo: str, pr_number: int) -> str:
+        """Get pull request info as a chronological timeline."""
+        timeline = await gh.get_timeline(repo, pr_number)
+        return _format_timeline(timeline)
+
+    @mcp.tool
+    async def get_pr_diff(repo: str, pr_number: int) -> str:
+        """Get the raw unified diff for a pull request."""
+        return await gh.get_diff(repo, pr_number)
+
+    @mcp.tool
+    async def get_pr_files(repo: str, pr_number: int) -> list[PRFile]:
+        """Get changed files in a pull request with per-file diffs."""
+        return await gh.get_files(repo, pr_number)
+
+
+def _register_review_tools(
+    mcp: FastMCP,
+    gh: GitHubPRClient,
+    FastReview_: type[FastReview],
+    ThoroughReview_: type[ThoroughReview],
+) -> None:
+    """Register review_pr_fast and review_pr_thorough tools."""
+
+    @mcp.tool
+    async def review_pr_fast(
+        repo: str,
+        pr_number: int,
+        focus_areas: str | None = None,
+        ctx: Context | None = None,
+    ) -> PRReviewResult:
+        """Fast PR review using a single structured sampling call.
+
+        One LLM call — sends the full diff and gets back a structured
+        review result. No tool calling. Best for small PRs or quick checks.
+        """
+        if ctx is None:
+            raise ValueError("Context is required for review tools")
+        inp = await _build_review_input(gh, repo, pr_number, focus_areas=focus_areas)
+        return await FastReview_().run(ctx, inp)
+
+    @mcp.tool
+    async def review_pr_thorough(
+        repo: str,
+        pr_number: int,
+        focus_areas: str | None = None,
+        intensity: str = "balanced",
+        ctx: Context | None = None,
+    ) -> PRReviewResult:
+        """Thorough PR review: filter + review + agentic verification.
+
+        Multi-pass pipeline with prior review awareness, intelligent
+        file filtering, per-file review with verification protocol,
+        and agentic exploration to confirm findings. Configurable
+        intensity: conservative, balanced, or aggressive.
+        """
+        if ctx is None:
+            raise ValueError("Context is required for review tools")
+        inp, head_sha = await _build_thorough_review_input(
+            gh, repo, pr_number, focus_areas=focus_areas
+        )
+        file_reader = _make_pr_file_reader(gh, repo, head_sha)
+        pipeline = ThoroughReview_(intensity=intensity)
+        return await pipeline.run(ctx, inp, file_reader)
+
+
+def _register_diff_tools(
+    mcp: FastMCP,
+    gh: GitHubPRClient,
+    FastReview_: type[FastReview],
+) -> None:
+    """Register review_diff_fast tool."""
+
+    @mcp.tool
+    async def review_diff_fast(
+        diff: str,
+        repo: str | None = None,
+        title: str = "Diff review",
+        description: str = "",
+        focus_areas: str | None = None,
+        ctx: Context | None = None,
+    ) -> PRReviewResult:
+        """Review a raw unified diff (not tied to a PR).
+
+        Accepts a unified diff string and reviews it using the fast
+        single-shot pipeline. Optionally provide a repo for project
+        context (README, AGENTS.md, etc.).
+        """
+        if ctx is None:
+            raise ValueError("Context is required for review tools")
+        files = _parse_diff_to_files(diff)
+
+        project_ctx = ""
+        if repo:
+            project_ctx = await gather_project_context(gh, repo)
+
+        inp = ReviewInput(
+            files=files,
+            title=title,
+            description=description,
+            project_context=project_ctx,
+            focus_areas=focus_areas,
+        )
+        return await FastReview_().run(ctx, inp)
+
+
 def create_server(
     *,
     github_token: str | None = None,
@@ -193,231 +403,9 @@ def create_server(
         sampling_handler_behavior="fallback",
     )
 
-    # ── Data tools ───────────────────────────────────────────────────────
-
-    @mcp.tool
-    async def get_pr_info(repo: str, pr_number: int) -> str:
-        """Get pull request info as a chronological timeline.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-        """
-        timeline = await gh.get_timeline(repo, pr_number)
-        return _format_timeline(timeline)
-
-    @mcp.tool
-    async def get_pr_diff(repo: str, pr_number: int) -> str:
-        """Get the raw unified diff for a pull request.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-        """
-        return await gh.get_diff(repo, pr_number)
-
-    @mcp.tool
-    async def get_pr_files(repo: str, pr_number: int) -> list[PRFile]:
-        """Get changed files in a pull request with per-file diffs.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-        """
-        return await gh.get_files(repo, pr_number)
-
-    # ── Shared context gathering ────────────────────────────────────────
-
-    async def _fetch_pr_context(
-        repo: str,
-        pr_number: int,
-    ) -> tuple[PRTimeline, str, list[str]]:
-        """Fetch PR timeline, project docs, and linked issues.
-
-        Returns (timeline, project_context, linked_issues).
-        """
-        timeline = await gh.get_timeline(repo, pr_number)
-        pr = timeline.pr
-        project_ctx, issues = await asyncio.gather(
-            gather_project_context(gh, repo, pr.head_sha),
-            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
-        )
-        return timeline, project_ctx, issues
-
-    async def _build_review_input(
-        repo: str,
-        pr_number: int,
-        *,
-        focus_areas: str | None = None,
-    ) -> ReviewInput:
-        """Build a ReviewInput from PR data — fetches timeline, project docs, linked issues."""
-        timeline, project_ctx, issues = await _fetch_pr_context(
-            repo,
-            pr_number,
-        )
-        pr = timeline.pr
-        return ReviewInput(
-            files=timeline.files,
-            title=pr.title,
-            description=pr.body or "",
-            author=pr.author.login,
-            pr_number=pr_number,
-            head_ref=pr.head_ref,
-            base_ref=pr.base_ref,
-            additions=pr.additions,
-            deletions=pr.deletions,
-            changed_files=pr.changed_files,
-            project_context=project_ctx,
-            linked_issues=issues,
-            focus_areas=focus_areas,
-        )
-
-    async def _build_thorough_review_input(
-        repo: str,
-        pr_number: int,
-        *,
-        focus_areas: str | None = None,
-    ) -> tuple[ReviewInput, str]:
-        """Build ReviewInput with thorough-mode extras (threads, prior reviews, commits).
-
-        Derives existing_threads and prior_reviews from the timeline instead of
-        re-fetching — get_timeline() already has all the data.
-        """
-        timeline = await gh.get_timeline(repo, pr_number)
-        pr = timeline.pr
-        project_ctx, issues = await asyncio.gather(
-            gather_project_context(gh, repo, pr.head_sha),
-            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
-        )
-
-        existing_threads, prior_reviews = _build_review_context_from_events(timeline.events)
-
-        inp = ReviewInput(
-            files=timeline.files,
-            title=pr.title,
-            description=pr.body or "",
-            author=pr.author.login,
-            pr_number=pr_number,
-            head_ref=pr.head_ref,
-            base_ref=pr.base_ref,
-            additions=pr.additions,
-            deletions=pr.deletions,
-            changed_files=pr.changed_files,
-            project_context=project_ctx,
-            linked_issues=issues,
-            focus_areas=focus_areas,
-            existing_threads=existing_threads,
-            prior_reviews=prior_reviews,
-            commits=timeline.commits,
-        )
-        return inp, pr.head_sha
-
-    def _make_pr_file_reader(repo: str, head_sha: str) -> FileReader:
-        """Create a FileReader that reads files from a PR's head ref."""
-
-        async def file_reader(filepath: str) -> str:
-            return await gh.get_file_contents(repo, filepath, head_sha) or ""
-
-        return file_reader
-
-    # ── Fast mode: one sample call, structured output, no tools ──────────
-
-    @mcp.tool
-    async def review_pr_fast(
-        repo: str,
-        pr_number: int,
-        focus_areas: str | None = None,
-        ctx: Context | None = None,
-    ) -> PRReviewResult:
-        """Fast PR review using a single structured sampling call.
-
-        One LLM call — sends the full diff and gets back a structured
-        review result. No tool calling. Best for small PRs or quick checks.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-            focus_areas: Optional areas to focus on (e.g. 'security')
-        """
-        if ctx is None:
-            raise ValueError("Context is required for review tools")
-        inp = await _build_review_input(repo, pr_number, focus_areas=focus_areas)
-        return await FastReview().run(ctx, inp)
-
-    # ── Thorough mode: multi-pass pipeline ────────────────────────────────
-
-    @mcp.tool
-    async def review_pr_thorough(
-        repo: str,
-        pr_number: int,
-        focus_areas: str | None = None,
-        intensity: str = "balanced",
-        ctx: Context | None = None,
-    ) -> PRReviewResult:
-        """Thorough PR review: filter + review + agentic verification.
-
-        Multi-pass pipeline with prior review awareness, intelligent
-        file filtering, per-file review with verification protocol,
-        and agentic exploration to confirm findings. Configurable
-        intensity: conservative, balanced, or aggressive.
-
-        Args:
-            repo: Repository in 'owner/repo' format
-            pr_number: The pull request number
-            focus_areas: Optional areas to focus on (e.g. 'security')
-            intensity: Review depth — conservative, balanced, aggressive
-        """
-        if ctx is None:
-            raise ValueError("Context is required for review tools")
-        inp, head_sha = await _build_thorough_review_input(
-            repo,
-            pr_number,
-            focus_areas=focus_areas,
-        )
-        file_reader = _make_pr_file_reader(repo, head_sha)
-        pipeline = ThoroughReview(intensity=intensity)
-        return await pipeline.run(ctx, inp, file_reader)
-
-    # ── Diff review: review a raw unified diff ────────────────────────────
-
-    @mcp.tool
-    async def review_diff_fast(
-        diff: str,
-        repo: str | None = None,
-        title: str = "Diff review",
-        description: str = "",
-        focus_areas: str | None = None,
-        ctx: Context | None = None,
-    ) -> PRReviewResult:
-        """Review a raw unified diff (not tied to a PR).
-
-        Accepts a unified diff string and reviews it using the fast
-        single-shot pipeline. Optionally provide a repo for project
-        context (README, AGENTS.md, etc.).
-
-        Args:
-            diff: Raw unified diff text
-            repo: Optional 'owner/repo' for project context
-            title: Label for the review (default: 'Diff review')
-            description: Description or context for the diff
-            focus_areas: Optional areas to focus on (e.g. 'security')
-        """
-        if ctx is None:
-            raise ValueError("Context is required for review tools")
-        files = _parse_diff_to_files(diff)
-
-        project_ctx = ""
-        if repo:
-            project_ctx = await gather_project_context(gh, repo)
-
-        inp = ReviewInput(
-            files=files,
-            title=title,
-            description=description,
-            project_context=project_ctx,
-            focus_areas=focus_areas,
-        )
-        return await FastReview().run(ctx, inp)
+    _register_data_tools(mcp, gh)
+    _register_review_tools(mcp, gh, FastReview, ThoroughReview)
+    _register_diff_tools(mcp, gh, FastReview)
 
     return mcp
 

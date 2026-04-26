@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 from fastmcp_pr_review.models import (
     CommentCategory,
     FileReader,
+    PRReviewComment,
     PRReviewResult,
     ReviewComment,
     ReviewInput,
@@ -165,31 +166,9 @@ def _make_batches(
     """Group files into batches by size for review.
 
     Small files get batched together. Large files get their own batch.
+    Delegates to ThoroughReview._make_batches for the implementation.
     """
-    batches: list[list[DiffChunk]] = []
-    current: list[DiffChunk] = []
-    current_size = 0
-
-    for c in items:
-        patch_size = len(c.patch)
-
-        if patch_size > max_bytes:
-            if current:
-                batches.append(current)
-                current, current_size = [], 0
-            batches.append([c])
-            continue
-
-        if current_size + patch_size > max_bytes or len(current) >= max_items:
-            batches.append(current)
-            current, current_size = [], 0
-
-        current.append(c)
-        current_size += patch_size
-
-    if current:
-        batches.append(current)
-    return batches
+    return ThoroughReview._make_batches(items, max_items=max_items, max_bytes=max_bytes)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -296,11 +275,35 @@ your concerns before flagging them.
 Verification protocol — complete ALL steps before calling add_finding:
 1. What specific code pattern or change triggers this concern?
 2. Is it handled elsewhere? Read the caller, check for middleware, look at types.
-3. Construct a concrete failure scenario with specific input/state. If you cannot: STOP.
-4. Would a senior engineer on this team agree this is worth flagging? If unsure: STOP.
+3. Construct a concrete failure scenario with specific input/state.
+4. Would a senior engineer on this team agree this is worth flagging?
 
-No findings is valid and expected for most batches. Do not re-flag issues from \
-existing review threads. Do not repeat points from prior reviews.
+== Guard clauses that claim guarantees ==
+When code has an early-return guard that promises to preserve behavior (e.g.,
+"suppress_X", "if not enabled: return early"), the guard itself is not the
+complete picture. Read the skipped path and ask: does the promised behavior
+actually happen in the suppressed code? A contradiction between a guard's
+promise and what the skipped path does is a bug.
+
+== Stopping rule ==
+If you cannot complete step 3 (construct a failure scenario) from the
+visible code, do NOT stop — read the surrounding and called code before
+giving up. Architectural issues often require tracing through call chains.
+
+== Prior review awareness ==
+Do not repeat specific style nitpicks from existing review threads.
+Do not re-report architectural concerns from prior reviews without independent
+verification. However: independently analyze such concerns using the protocol
+above — confirm it properly or find that the prior report was wrong. Do not
+blindly suppress architectural concerns just because a prior review mentioned them.
+
+== Behavioral changes ==
+Flag changes that alter the semantics of an API or behavior, even if the new
+behavior appears more correct. Callers who relied on the old behavior may be
+silently broken. This includes changes to how special values (None, 0, empty)
+are interpreted, or changes to what a guard clause actually guarantees.
+
+No findings is valid and expected for most batches.
 
 Intensity levels (the message will specify which):
   conservative: only flag confidence >= 80, zero comments is the expected outcome
@@ -341,6 +344,144 @@ Rules:
         self.filter_batch_size = filter_batch_size
         self.min_confidence = min_confidence
 
+    # -- Batching -----------------------------------------------------------
+
+    @staticmethod
+    def _make_batches(
+        items: list[DiffChunk],
+        *,
+        max_items: int = MAX_BATCH_ITEMS,
+        max_bytes: int = MAX_BATCH_BYTES,
+    ) -> list[list[DiffChunk]]:
+        """Group files into batches by size for review.
+
+        Small files get batched together. Large files get their own batch.
+        """
+        batches: list[list[DiffChunk]] = []
+        current: list[DiffChunk] = []
+        current_size = 0
+
+        for c in items:
+            patch_size = len(c.patch)
+
+            if patch_size > max_bytes:
+                if current:
+                    batches.append(current)
+                    current, current_size = [], 0
+                batches.append([c])
+                continue
+
+            if current_size + patch_size > max_bytes or len(current) >= max_items:
+                batches.append(current)
+                current, current_size = [], 0
+
+            current.append(c)
+            current_size += patch_size
+
+        if current:
+            batches.append(current)
+        return batches
+
+    # -- Prompt building helpers ---------------------------------------------
+
+    @staticmethod
+    def _format_file_section(
+        chunk: DiffChunk,
+        existing_threads: dict[str, list[PRReviewComment]],
+    ) -> str:
+        """Build a single <file_diff> section with existing thread context."""
+        existing = existing_threads.get(chunk.filename, [])
+        threads_text = "(none)"
+        if existing:
+            threads_text = "\n".join(
+                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
+            )
+        return (
+            f"<file_diff>\n"
+            f"File: {chunk.filename} ({chunk.status}, "
+            f"+{chunk.additions} -{chunk.deletions})\n"
+            f"```diff\n{chunk.patch}\n```\n"
+            f"Existing threads: {threads_text}\n"
+            f"</file_diff>"
+        )
+
+    @staticmethod
+    def _build_review_message(
+        batch: list[DiffChunk],
+        inp: ReviewInput,
+        file_sections: list[str],
+        intensity: str,
+    ) -> str:
+        """Build the user message content for a review batch.
+
+        Pure function — fully testable without mocks.
+        Static content ordering for KV cache efficiency: instructions come first,
+        dynamic content (diffs, prior reviews) comes last.
+        """
+        prior_section = "(none)"
+        if inp.prior_reviews:
+            prior_section = "\n---\n".join(body[:300] for body in inp.prior_reviews[:3])
+
+        project_section = ""
+        if inp.project_context:
+            project_section = f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
+
+        issues_section = ""
+        if inp.linked_issues:
+            issues_text = "\n\n".join(inp.linked_issues)
+            issues_section = (
+                f"\n<linked_issues>\n"
+                f"Review against these requirements:\n"
+                f"{issues_text}\n"
+                f"</linked_issues>\n"
+            )
+
+        data = f"Intensity: {intensity}\n"
+        data += f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
+        if inp.description:
+            data += f"Description: {inp.description}\n"
+        if inp.focus_areas:
+            data += f"Focus: {inp.focus_areas}\n"
+        data += f"{project_section}{issues_section}\n"
+
+        if inp.commits:
+            msgs = [c.message.split("\n")[0] for c in inp.commits[:10]]
+            commits_section = f"<commits>\n{inp.title} has {len(inp.commits)} commits:\n"
+            for msg in msgs:
+                commits_section += f"  - {msg}\n"
+            if len(inp.commits) > 10:
+                commits_section += f"  ... and {len(inp.commits) - 10} more\n"
+            commits_section += "</commits>\n"
+            data += commits_section
+
+        data += "\n\n".join(file_sections)
+        if prior_section != "(none)":
+            data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
+
+        return data
+
+    @staticmethod
+    def _build_verify_message(
+        inp: ReviewInput,
+        findings: list[PotentialFinding],
+    ) -> str:
+        """Build the user message content for the verify pass.
+
+        Pure function — fully testable without mocks.
+        """
+        finding_lines = []
+        for i, f in enumerate(findings):
+            finding_lines.append(
+                f'<finding index="{i}">\n'
+                f"{f.path}:{f.line or '?'} -- {f.title}\n"
+                f"{f.body}\n"
+                f"Verify: {f.verification_needs}\n"
+                f"</finding>"
+            )
+
+        n = len(findings)
+        return f"{inp.title} | @{inp.author}\nVerify {n} findings:\n\n" + "\n\n".join(finding_lines)
+
     # -- Exploration tools --------------------------------------------------
 
     def make_exploration_tools(
@@ -359,7 +500,7 @@ Rules:
             logger.debug("thorough: tool get_file_contents(%s)", filepath)
             return await file_reader(filepath)
 
-        def lookup_file_diff(filename: str) -> str:
+        async def lookup_file_diff(filename: str) -> str:
             """See another file's diff from this PR."""
             logger.debug("thorough: tool lookup_file_diff(%s)", filename)
             for f in inp.files:
@@ -367,7 +508,7 @@ Rules:
                     return f.patch or "(no patch available)"
             return f"File '{filename}' not in this PR"
 
-        def list_changed_files() -> str:
+        async def list_changed_files() -> str:
             """List all files changed in this PR."""
             logger.debug("thorough: tool list_changed_files()")
             return "\n".join(
@@ -505,54 +646,10 @@ Rules:
         file_reader: FileReader,
     ) -> list[PotentialFinding]:
         """Review a batch of files. Findings collected via add_finding() tool calls."""
-        # Build per-file diff sections with existing threads
-        file_sections = []
-        for chunk in batch:
-            existing = inp.existing_threads.get(chunk.filename, [])
-            threads_text = "(none)"
-            if existing:
-                threads_text = "\n".join(
-                    f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
-                )
-            file_sections.append(
-                f"<file_diff>\n"
-                f"File: {chunk.filename} ({chunk.status}, "
-                f"+{chunk.additions} -{chunk.deletions})\n"
-                f"```diff\n{chunk.patch}\n```\n"
-                f"Existing threads: {threads_text}\n"
-                f"</file_diff>"
-            )
-
-        # Format prior review bodies (shared across batch)
-        prior_section = "(none)"
-        if inp.prior_reviews:
-            prior_section = "\n---\n".join(body[:300] for body in inp.prior_reviews[:3])
-
-        # Format project context and linked issues
-        project_section = ""
-        if inp.project_context:
-            project_section = f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
-
-        issues_section = ""
-        if inp.linked_issues:
-            issues_text = "\n\n".join(inp.linked_issues)
-            issues_section = (
-                f"\n<linked_issues>\n"
-                f"Review against these requirements:\n"
-                f"{issues_text}\n"
-                f"</linked_issues>\n"
-            )
-
-        data = f"Intensity: {self.intensity}\n"
-        data += f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
-        if inp.description:
-            data += f"Description: {inp.description}\n"
-        if inp.focus_areas:
-            data += f"Focus: {inp.focus_areas}\n"
-        data += f"{project_section}{issues_section}\n"
-        data += "\n\n".join(file_sections)
-        if prior_section != "(none)":
-            data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
+        file_sections = [
+            self._format_file_section(chunk, inp.existing_threads) for chunk in batch
+        ]
+        data = self._build_review_message(batch, inp, file_sections, self.intensity)
 
         # --- State that accumulates via tool calls ---
         findings: list[PotentialFinding] = []
@@ -594,6 +691,10 @@ Rules:
 
         exploration_tools = self.make_exploration_tools(inp, file_reader)
 
+        # Static-first message ordering for KV cache efficiency:
+        # - system_prompt: identical every call → always cached
+        # - REVIEW_INSTRUCTIONS: identical every call → cached as second message
+        # - data (diffs, prior reviews, commits): varies per batch → cache break
         try:
             await ctx.sample(
                 messages=[self.REVIEW_INSTRUCTIONS, data],
@@ -680,19 +781,7 @@ Rules:
                 f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
             )
 
-        # --- Build compact finding list ---
-        finding_lines = []
-        for i, f in enumerate(findings):
-            finding_lines.append(
-                f'<finding index="{i}">\n'
-                f"{f.path}:{f.line or '?'} -- {f.title}\n"
-                f"{f.body}\n"
-                f"Verify: {f.verification_needs}\n"
-                f"</finding>"
-            )
-
-        n = len(findings)
-        data = f"{inp.title} | @{inp.author}\nVerify {n} findings:\n\n" + "\n\n".join(finding_lines)
+        data = self._build_verify_message(inp, findings)
 
         exploration_tools = self.make_exploration_tools(inp, file_reader)
 
