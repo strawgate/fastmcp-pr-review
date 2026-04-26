@@ -1,5 +1,7 @@
 """Tests for the fast single-shot review mode."""
 
+from __future__ import annotations
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -124,3 +126,94 @@ class TestFastReview:
 
         pipeline = SecurityReview()
         assert pipeline.SYSTEM_PROMPT == "You are a security auditor."
+
+    @pytest.mark.asyncio
+    async def test_run_sets_files_reviewed_count(self) -> None:
+        """run() should set files_reviewed from input, not LLM output."""
+        ctx = MagicMock()
+        result = _make_result()
+        assert result.files_reviewed == 0  # default from LLM
+        ctx.sample = AsyncMock(return_value=MagicMock(result=result))
+
+        inp = _make_inp(
+            files=[
+                PRFile(
+                    filename="a.py",
+                    status="modified",
+                    additions=1,
+                    deletions=0,
+                    changes=1,
+                    patch="+x",
+                ),
+                PRFile(
+                    filename="b.png",
+                    status="modified",
+                    additions=0,
+                    deletions=0,
+                    changes=0,
+                    patch=None,
+                ),
+            ]
+        )
+        pipeline = FastReview()
+        out = await pipeline.run(ctx, inp)
+        assert out.files_reviewed == 1  # only a.py has a patch
+        assert out.files_skipped == 1  # b.png has no patch
+
+
+class TestBuildPrompt:
+    """Tests for FastReview.build_prompt() edge cases."""
+
+    def test_empty_files(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp(files=[]))
+        assert "(no patches available)" in prompt
+
+    def test_with_project_context(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp(project_context="Django REST API"))
+        assert "Project Context" in prompt
+        assert "Django REST API" in prompt
+
+    def test_with_linked_issues(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(
+            _make_inp(linked_issues=["Issue #42: Fix the widget"])
+        )
+        assert "Linked Issues" in prompt
+        assert "Issue #42: Fix the widget" in prompt
+
+    def test_pr_number_none(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp(pr_number=None))
+        assert "PR #" not in prompt
+
+    def test_pr_number_present(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp(pr_number=5))
+        assert "PR #5" in prompt
+
+    def test_no_author(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp(author=""))
+        assert "@" not in prompt
+
+    def test_only_head_ref_no_base_ref(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(_make_inp(head_ref="feature", base_ref=""))
+        assert "feature" in prompt
+        assert "->" not in prompt
+
+    def test_with_stats(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(
+            _make_inp(additions=10, deletions=5, changed_files=2)
+        )
+        assert "Stats:" in prompt
+
+    def test_no_stats_all_zero(self) -> None:
+        pipeline = FastReview()
+        prompt = pipeline.build_prompt(
+            _make_inp(additions=0, deletions=0, changed_files=0)
+        )
+        assert "Stats:" not in prompt

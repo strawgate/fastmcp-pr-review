@@ -43,6 +43,7 @@ class GitHubPRClient:
         self._github = GitHub(token)
 
     async def get_pr_details(self, repo: str, pr_number: int) -> PRDetails:
+        """Fetch PR metadata (title, author, state, refs, stats)."""
         owner, repo_name = _parse_owner_repo(repo)
         resp = await self._github.rest.pulls.async_get(owner, repo_name, pr_number)
         pr = resp.parsed_data
@@ -70,6 +71,7 @@ class GitHubPRClient:
         )
 
     async def get_comments(self, repo: str, pr_number: int) -> list[PRComment]:
+        """Fetch issue-level comments on a PR."""
         owner, repo_name = _parse_owner_repo(repo)
         comments: list[PRComment] = []
         async for comment in self._github.rest.paginate(
@@ -94,6 +96,7 @@ class GitHubPRClient:
         return comments
 
     async def get_reviews(self, repo: str, pr_number: int) -> list[PRReview]:
+        """Fetch review submissions (approved, changes_requested, etc.)."""
         owner, repo_name = _parse_owner_repo(repo)
         resp = await self._github.rest.pulls.async_list_reviews(owner, repo_name, pr_number)
         return [
@@ -112,6 +115,7 @@ class GitHubPRClient:
         ]
 
     async def get_review_comments(self, repo: str, pr_number: int) -> list[PRReviewComment]:
+        """Fetch inline review comments (attached to specific lines)."""
         owner, repo_name = _parse_owner_repo(repo)
         review_comments: list[PRReviewComment] = []
         async for rc in self._github.rest.paginate(
@@ -143,6 +147,7 @@ class GitHubPRClient:
         return review_comments
 
     async def get_commits(self, repo: str, pr_number: int) -> list[PRCommit]:
+        """Fetch the list of commits in a PR."""
         owner, repo_name = _parse_owner_repo(repo)
         resp = await self._github.rest.pulls.async_list_commits(
             owner, repo_name, pr_number, per_page=100
@@ -158,6 +163,7 @@ class GitHubPRClient:
         ]
 
     async def get_files(self, repo: str, pr_number: int) -> list[PRFile]:
+        """Fetch the list of changed files with patches and stats."""
         owner, repo_name = _parse_owner_repo(repo)
         files: list[PRFile] = []
         async for f in self._github.rest.paginate(
@@ -180,6 +186,7 @@ class GitHubPRClient:
         return files
 
     async def get_diff(self, repo: str, pr_number: int) -> str:
+        """Fetch the raw unified diff text for a PR."""
         owner, repo_name = _parse_owner_repo(repo)
         resp = await self._github.rest.pulls.async_get(
             owner,

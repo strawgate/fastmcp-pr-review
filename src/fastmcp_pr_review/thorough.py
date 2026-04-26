@@ -439,14 +439,21 @@ Rules:
                 f"Classify {len(batch)} files:\n\n" + "\n\n".join(chunk_texts)
             )
 
-            r = await ctx.sample(
-                messages=[self.FILTER_INSTRUCTIONS, data],
-                system_prompt=self.SYSTEM_PROMPT,
-                result_type=FilterBatchResult,
-                temperature=0.1,
-                max_tokens=8192,
-            )
-            return r.result
+            try:
+                r = await ctx.sample(
+                    messages=[self.FILTER_INSTRUCTIONS, data],
+                    system_prompt=self.SYSTEM_PROMPT,
+                    result_type=FilterBatchResult,
+                    temperature=0.1,
+                    max_tokens=8192,
+                )
+                return r.result
+            except Exception as exc:
+                logger.warning("thorough: filter batch failed: %s", exc)
+                # On failure, don't skip any files — let them through to review
+                return FilterBatchResult(
+                    chunks=[FilteredChunk(index=c.index, skip=False) for c in batch]
+                )
 
         # All batches run concurrently
         results = await asyncio.gather(*(filter_batch(b) for b in batches))
@@ -601,7 +608,7 @@ Rules:
                 temperature=0.2,
                 max_tokens=8192,
             )
-        except (ValueError, RuntimeError) as exc:
+        except Exception as exc:
             logger.warning("thorough: review batch failed: %s", exc)
 
         for f in findings:
@@ -710,7 +717,7 @@ Rules:
                 temperature=0.2,
                 max_tokens=8192,
             )
-        except (ValueError, RuntimeError) as exc:
+        except Exception as exc:
             logger.warning("thorough: verify failed: %s", exc)
 
         return confirmed

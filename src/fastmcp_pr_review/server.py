@@ -198,6 +198,24 @@ def create_server(
 
     # ── Shared context gathering ────────────────────────────────────────
 
+    async def _fetch_pr_context(
+        repo: str,
+        pr_number: int,
+        *,
+        focus_areas: str | None = None,
+    ) -> tuple[PRTimeline, str, list[str]]:
+        """Fetch PR timeline, project docs, and linked issues.
+
+        Returns (timeline, project_context, linked_issues).
+        """
+        timeline = await gh.get_timeline(repo, pr_number)
+        pr = timeline.pr
+        project_ctx, issues = await asyncio.gather(
+            gather_project_context(gh, repo, pr.head_sha),
+            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+        )
+        return timeline, project_ctx, issues
+
     async def _build_review_input(
         repo: str,
         pr_number: int,
@@ -205,12 +223,10 @@ def create_server(
         focus_areas: str | None = None,
     ) -> ReviewInput:
         """Build a ReviewInput from PR data — fetches timeline, project docs, linked issues."""
-        timeline = await gh.get_timeline(repo, pr_number)
-        pr = timeline.pr
-        project_ctx, issues = await asyncio.gather(
-            gather_project_context(gh, repo, pr.head_sha),
-            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+        timeline, project_ctx, issues = await _fetch_pr_context(
+            repo, pr_number, focus_areas=focus_areas,
         )
+        pr = timeline.pr
         return ReviewInput(
             files=timeline.files,
             title=pr.title,
@@ -237,16 +253,14 @@ def create_server(
 
         Returns (ReviewInput, head_sha) so the caller can build a FileReader.
         """
-        timeline, comments_by_file, prior_reviews = await asyncio.gather(
-            gh.get_timeline(repo, pr_number),
-            gh.get_review_comments_by_file(repo, pr_number),
-            gh.get_prior_review_bodies(repo, pr_number),
+        (timeline, project_ctx, issues), comments_by_file, prior_reviews = (
+            await asyncio.gather(
+                _fetch_pr_context(repo, pr_number, focus_areas=focus_areas),
+                gh.get_review_comments_by_file(repo, pr_number),
+                gh.get_prior_review_bodies(repo, pr_number),
+            )
         )
         pr = timeline.pr
-        project_ctx, issues = await asyncio.gather(
-            gather_project_context(gh, repo, pr.head_sha),
-            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
-        )
         inp = ReviewInput(
             files=timeline.files,
             title=pr.title,
@@ -293,7 +307,8 @@ def create_server(
             pr_number: The pull request number
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
-        assert ctx is not None
+        if ctx is None:
+            raise ValueError("Context is required for review tools")
         inp = await _build_review_input(repo, pr_number, focus_areas=focus_areas)
         return await FastReview().run(ctx, inp)
 
@@ -320,7 +335,8 @@ def create_server(
             focus_areas: Optional areas to focus on (e.g. 'security')
             intensity: Review depth — conservative, balanced, aggressive
         """
-        assert ctx is not None
+        if ctx is None:
+            raise ValueError("Context is required for review tools")
         inp, head_sha = await _build_thorough_review_input(
             repo, pr_number, focus_areas=focus_areas,
         )
@@ -352,7 +368,8 @@ def create_server(
             description: Description or context for the diff
             focus_areas: Optional areas to focus on (e.g. 'security')
         """
-        assert ctx is not None
+        if ctx is None:
+            raise ValueError("Context is required for review tools")
         files = _parse_diff_to_files(diff)
 
         project_ctx = ""

@@ -145,6 +145,10 @@ Finding no issues is a valid outcome -- do not invent problems."""
         )
 
         review = result.result
+        # The LLM can't reliably count files — set these from the input data.
+        review.files_reviewed = n_files
+        review.files_skipped = len(inp.files) - n_files
+
         logger.info(
             "fast: done — %s, %d comments",
             review.verdict,

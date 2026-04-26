@@ -20,12 +20,14 @@ from fastmcp_pr_review.models import (
     Severity,
 )
 from fastmcp_pr_review.thorough import (
+    DiffChunk,
     FilterBatchResult,
     FilteredChunk,
     PotentialFinding,
     ReviewDone,
     ThoroughReview,
     VerifyComplete,
+    _make_batches,
 )
 
 
@@ -264,6 +266,77 @@ class TestReviewFiles:
         ]
         results = await pipeline.review_files(ctx, chunks, inp, _noop_file_reader)
         assert results == []
+
+
+class TestMakeBatches:
+    """Tests for the _make_batches batching helper."""
+
+    def _chunk(self, index: int, patch_size: int = 10) -> DiffChunk:
+        return DiffChunk(
+            index=index,
+            filename=f"f{index}.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            patch="x" * patch_size,
+        )
+
+    def test_empty_list(self) -> None:
+        assert _make_batches([]) == []
+
+    def test_single_small_item(self) -> None:
+        batches = _make_batches([self._chunk(0)])
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+
+    def test_multiple_items_under_limits(self) -> None:
+        items = [self._chunk(i, patch_size=10) for i in range(3)]
+        batches = _make_batches(items, max_items=10, max_bytes=1000)
+        assert len(batches) == 1
+        assert len(batches[0]) == 3
+
+    def test_exceeding_max_items(self) -> None:
+        items = [self._chunk(i, patch_size=5) for i in range(5)]
+        batches = _make_batches(items, max_items=2, max_bytes=10_000)
+        assert len(batches) == 3  # [0,1], [2,3], [4]
+        assert len(batches[0]) == 2
+        assert len(batches[1]) == 2
+        assert len(batches[2]) == 1
+
+    def test_single_oversized_item(self) -> None:
+        big = self._chunk(0, patch_size=500)
+        batches = _make_batches([big], max_items=10, max_bytes=100)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0].index == 0
+
+    def test_mix_normal_and_oversized(self) -> None:
+        items = [
+            self._chunk(0, patch_size=10),
+            self._chunk(1, patch_size=500),  # oversized
+            self._chunk(2, patch_size=10),
+        ]
+        batches = _make_batches(items, max_items=10, max_bytes=100)
+        # Batch 1: [chunk0], flushed before oversized
+        # Batch 2: [chunk1] (oversized, own batch)
+        # Batch 3: [chunk2]
+        assert len(batches) == 3
+        assert batches[0][0].index == 0
+        assert batches[1][0].index == 1
+        assert batches[2][0].index == 2
+
+    def test_boundary_exactly_at_max_items(self) -> None:
+        items = [self._chunk(i, patch_size=5) for i in range(3)]
+        batches = _make_batches(items, max_items=3, max_bytes=10_000)
+        assert len(batches) == 1
+        assert len(batches[0]) == 3
+
+    def test_one_more_than_max_items(self) -> None:
+        items = [self._chunk(i, patch_size=5) for i in range(4)]
+        batches = _make_batches(items, max_items=3, max_bytes=10_000)
+        assert len(batches) == 2
+        assert len(batches[0]) == 3
+        assert len(batches[1]) == 1
 
 
 class TestFullPipeline:
