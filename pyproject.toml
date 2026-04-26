@@ -64,10 +64,19 @@ select = [
     "C4",    # flake8-comprehensions
     "PERF",  # perflint
     "RET",   # flake8-return
+    "S",     # bandit (security)
+    "T20",   # flake8-print
+    "PGH005",  # invalid noqa comments
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "src/fastmcp_pr_review/github_client.py" = ["PERF401"]  # async paginators can't use list comp
+"tests/**" = [
+    "S101",   # assert is fine in tests
+    "T20",    # print is fine in tests
+    "S104",   # 0.0.0.0 binding in HTTP server tests
+    "S106",   # test credentials are "fake"
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["fastmcp_pr_review"]
