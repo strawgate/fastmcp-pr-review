@@ -405,6 +405,83 @@ Rules:
             f"</file_diff>"
         )
 
+    @staticmethod
+    def _build_review_message(
+        batch: list[DiffChunk],
+        inp: ReviewInput,
+        file_sections: list[str],
+        intensity: str,
+    ) -> str:
+        """Build the user message content for a review batch.
+
+        Pure function — fully testable without mocks.
+        Static content ordering for KV cache efficiency: instructions come first,
+        dynamic content (diffs, prior reviews) comes last.
+        """
+        prior_section = "(none)"
+        if inp.prior_reviews:
+            prior_section = "\n---\n".join(body[:300] for body in inp.prior_reviews[:3])
+
+        project_section = ""
+        if inp.project_context:
+            project_section = f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
+
+        issues_section = ""
+        if inp.linked_issues:
+            issues_text = "\n\n".join(inp.linked_issues)
+            issues_section = (
+                f"\n<linked_issues>\n"
+                f"Review against these requirements:\n"
+                f"{issues_text}\n"
+                f"</linked_issues>\n"
+            )
+
+        data = f"Intensity: {intensity}\n"
+        data += f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
+        if inp.description:
+            data += f"Description: {inp.description}\n"
+        if inp.focus_areas:
+            data += f"Focus: {inp.focus_areas}\n"
+        data += f"{project_section}{issues_section}\n"
+
+        if inp.commits:
+            msgs = [c.message.split("\n")[0] for c in inp.commits[:10]]
+            commits_section = f"<commits>\n{inp.title} has {len(inp.commits)} commits:\n"
+            for msg in msgs:
+                commits_section += f"  - {msg}\n"
+            if len(inp.commits) > 10:
+                commits_section += f"  ... and {len(inp.commits) - 10} more\n"
+            commits_section += "</commits>\n"
+            data += commits_section
+
+        data += "\n\n".join(file_sections)
+        if prior_section != "(none)":
+            data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
+
+        return data
+
+    @staticmethod
+    def _build_verify_message(
+        inp: ReviewInput,
+        findings: list[PotentialFinding],
+    ) -> str:
+        """Build the user message content for the verify pass.
+
+        Pure function — fully testable without mocks.
+        """
+        finding_lines = []
+        for i, f in enumerate(findings):
+            finding_lines.append(
+                f'<finding index="{i}">\n'
+                f"{f.path}:{f.line or '?'} -- {f.title}\n"
+                f"{f.body}\n"
+                f"Verify: {f.verification_needs}\n"
+                f"</finding>"
+            )
+
+        n = len(findings)
+        return f"{inp.title} | @{inp.author}\nVerify {n} findings:\n\n" + "\n\n".join(finding_lines)
+
     # -- Exploration tools --------------------------------------------------
 
     def make_exploration_tools(
@@ -572,49 +649,7 @@ Rules:
         file_sections = [
             self._format_file_section(chunk, inp.existing_threads) for chunk in batch
         ]
-
-        # Format prior review bodies (shared across batch)
-        prior_section = "(none)"
-        if inp.prior_reviews:
-            prior_section = "\n---\n".join(body[:300] for body in inp.prior_reviews[:3])
-
-        # Format project context and linked issues
-        project_section = ""
-        if inp.project_context:
-            project_section = f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
-
-        issues_section = ""
-        if inp.linked_issues:
-            issues_text = "\n\n".join(inp.linked_issues)
-            issues_section = (
-                f"\n<linked_issues>\n"
-                f"Review against these requirements:\n"
-                f"{issues_text}\n"
-                f"</linked_issues>\n"
-            )
-
-        data = f"Intensity: {self.intensity}\n"
-        data += f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
-        if inp.description:
-            data += f"Description: {inp.description}\n"
-        if inp.focus_areas:
-            data += f"Focus: {inp.focus_areas}\n"
-        data += f"{project_section}{issues_section}\n"
-
-        commits_section = ""
-        if inp.commits:
-            msgs = [c.message.split("\n")[0] for c in inp.commits[:10]]
-            commits_section = f"<commits>\n{inp.title} has {len(inp.commits)} commits:\n"
-            for msg in msgs:
-                commits_section += f"  - {msg}\n"
-            if len(inp.commits) > 10:
-                commits_section += f"  ... and {len(inp.commits) - 10} more\n"
-            commits_section += "</commits>\n"
-        data += commits_section
-
-        data += "\n\n".join(file_sections)
-        if prior_section != "(none)":
-            data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
+        data = self._build_review_message(batch, inp, file_sections, self.intensity)
 
         # --- State that accumulates via tool calls ---
         findings: list[PotentialFinding] = []
@@ -746,19 +781,7 @@ Rules:
                 f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
             )
 
-        # --- Build compact finding list ---
-        finding_lines = []
-        for i, f in enumerate(findings):
-            finding_lines.append(
-                f'<finding index="{i}">\n'
-                f"{f.path}:{f.line or '?'} -- {f.title}\n"
-                f"{f.body}\n"
-                f"Verify: {f.verification_needs}\n"
-                f"</finding>"
-            )
-
-        n = len(findings)
-        data = f"{inp.title} | @{inp.author}\nVerify {n} findings:\n\n" + "\n\n".join(finding_lines)
+        data = self._build_verify_message(inp, findings)
 
         exploration_tools = self.make_exploration_tools(inp, file_reader)
 

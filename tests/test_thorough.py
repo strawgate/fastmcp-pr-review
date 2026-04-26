@@ -262,6 +262,332 @@ class TestReviewFiles:
         assert results == []
 
 
+class TestBuildReviewMessage:
+    """Tests for the pure _build_review_message static method."""
+
+    def test_includes_title_and_refs(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="Fix bug",
+            description="Fixes a bug",
+            author="dev",
+            pr_number=1,
+            head_ref="feat",
+            base_ref="main",
+            additions=10,
+            deletions=2,
+            changed_files=1,
+            commits=[],
+        )
+        batch = [
+            DiffChunk(
+                index=0,
+                filename="a.py",
+                status="modified",
+                additions=10,
+                deletions=2,
+                patch="+x",
+            )
+        ]
+        sections = [ThoroughReview._format_file_section(batch[0], {})]
+        msg = ThoroughReview._build_review_message(batch, inp, sections, "balanced")
+        assert "Fix bug" in msg
+        assert "feat -> main" in msg
+        assert "Intensity: balanced" in msg
+
+    def test_includes_description(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="This is the PR body",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "Description: This is the PR body" in msg
+
+    def test_prior_reviews_section_absent_when_empty(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "Prior reviews" not in msg
+
+    def test_prior_reviews_section_present(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            prior_reviews=["LGTM", "Nit: typo"],
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "Prior reviews" in msg
+        assert "LGTM" in msg
+        assert "Nit: typo" in msg
+
+    def test_truncates_prior_reviews_at_300_chars(self) -> None:
+        long_body = "x" * 400
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            prior_reviews=[long_body],
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "Prior reviews" in msg
+        assert "x" * 300 in msg
+        assert "x" * 400 not in msg
+
+    def test_commits_section_absent_when_empty(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "commits" not in msg
+
+    def test_commits_section_with_messages(self) -> None:
+        from fastmcp_pr_review.models import PRCommit
+
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[
+                PRCommit(
+                    sha="abc",
+                    message="feat: add feature",
+                    author_name="dev",
+                    author_date=datetime(2025, 1, 1, tzinfo=UTC),
+                ),
+                PRCommit(
+                    sha="def",
+                    message="fix: broken thing",
+                    author_name="dev",
+                    author_date=datetime(2025, 1, 2, tzinfo=UTC),
+                ),
+            ],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "commits" in msg
+        assert "feat: add feature" in msg
+        assert "fix: broken thing" in msg
+
+    def test_project_context_tag_present(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            project_context="README says use X pattern",
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "<project_context>" in msg
+        assert "README says use X pattern" in msg
+
+    def test_linked_issues_tag_present(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            linked_issues=["Fixes #123"],
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "<linked_issues>" in msg
+        assert "Fixes #123" in msg
+
+    def test_file_sections_appended(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        batch = [
+            DiffChunk(
+                index=0,
+                filename="a.py",
+                status="modified",
+                additions=3,
+                deletions=1,
+                patch="+a\n-b",
+            )
+        ]
+        sections = [ThoroughReview._format_file_section(batch[0], {})]
+        msg = ThoroughReview._build_review_message(batch, inp, sections, "balanced")
+        assert "a.py" in msg
+        assert "<file_diff>" in msg
+
+    def test_focus_areas_line(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            focus_areas="security",
+            commits=[],
+        )
+        msg = ThoroughReview._build_review_message([], inp, [], "balanced")
+        assert "Focus: security" in msg
+
+
+class TestBuildVerifyMessage:
+    """Tests for the pure _build_verify_message static method."""
+
+    def test_empty_findings(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        msg = ThoroughReview._build_verify_message(inp, [])
+        assert "T" in msg
+        assert "dev" in msg
+
+    def test_findings_serialized(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        finding = PotentialFinding(
+            path="src/main.py",
+            line=10,
+            severity=Severity.HIGH,
+            category=CommentCategory.BUG,
+            title="SQL injection",
+            body="User input in query",
+            why="Could execute SQL",
+            confidence=80,
+            verification_needs="Check sanitization",
+        )
+        msg = ThoroughReview._build_verify_message(inp, [finding])
+        assert "src/main.py:10" in msg
+        assert "SQL injection" in msg
+        assert "Verify: Check sanitization" in msg
+        assert 'index="0"' in msg
+
+    def test_multiple_findings_indexed(self) -> None:
+        inp = ReviewInput(
+            files=[],
+            title="T",
+            description="",
+            author="dev",
+            pr_number=1,
+            head_ref="f",
+            base_ref="m",
+            additions=1,
+            deletions=0,
+            changed_files=1,
+            commits=[],
+        )
+        f1 = PotentialFinding(
+            path="a.py", line=1, severity=Severity.HIGH, category=CommentCategory.BUG,
+            title="Bug1", body="", why="", confidence=80, verification_needs="v1",
+        )
+        f2 = PotentialFinding(
+            path="b.py", line=2, severity=Severity.MEDIUM, category=CommentCategory.BUG,
+            title="Bug2", body="", why="", confidence=75, verification_needs="v2",
+        )
+        msg = ThoroughReview._build_verify_message(inp, [f1, f2])
+        assert 'index="0"' in msg
+        assert 'index="1"' in msg
+        assert "Bug1" in msg
+        assert "Bug2" in msg
+
+
 class TestMakeBatches:
     """Tests for the _make_batches batching helper."""
 
