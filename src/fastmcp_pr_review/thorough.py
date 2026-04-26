@@ -179,7 +179,17 @@ def _make_batches(
 class ThoroughReview:
     """Multi-pass review pipeline: filter → review → verify.
 
-    Override any step method or prompt for custom behavior.
+    Pipeline stages (each overridable):
+
+    1. ``prefilter()`` — sync, pattern-based skip of binary/generated files
+    2. ``filter_files()`` — LLM classifies files as skip/review (structured output)
+    3. ``review_files()`` — batched review with tool-based finding collection
+       (add_finding, get_file_contents, lookup_file_diff, list_changed_files)
+    4. ``verify_findings()`` — agentic pass: LLM explores repo to confirm/disprove
+       each finding before it becomes a final comment
+    5. ``aggregate()`` — score and produce final PRReviewResult
+
+    Override any step method or class-attribute prompt for custom behavior.
     """
 
     # -- Prompts (class attributes — override in subclasses) ----------------
@@ -628,6 +638,8 @@ Rules:
         batches = _make_batches(chunks)
         logger.info("thorough: %d files -> %d review batches", len(chunks), len(batches))
 
+        # Bounded concurrency: without this, N batches → N simultaneous LLM calls,
+        # risking rate limits and noisy logs. Default of 3 is conservative.
         sem = asyncio.Semaphore(self.concurrency)
 
         async def review(batch: list[DiffChunk]) -> list[PotentialFinding]:

@@ -91,7 +91,7 @@ make build
 
 ## Development
 
-See [DEVELOPING.md](DEVELOPING.md) for architecture, testing, and how the sampling patterns work.
+See [DEVELOPING.md](DEVELOPING.md) for testing and sampling patterns, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architecture and design decisions.
 
 ## License
 

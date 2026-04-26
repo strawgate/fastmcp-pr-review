@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 class FastReview:
     """Single-shot review pipeline — one LLM call, structured output.
 
+    Fast mode is intentionally lightweight: it receives the full diff and
+    project context, but does NOT include ``existing_threads`` or
+    ``prior_reviews`` from ``ReviewInput``. Prior review awareness requires
+    a separate LLM pass to reason over existing comments (as in thorough
+    mode). Including raw prior review text in a single-shot prompt would
+    bloat context and dilute focus.
+
     Override ``SYSTEM_PROMPT`` for domain-specific review focus.
     Override ``build_prompt()`` for custom prompt formatting.
     Override ``run()`` for a completely different flow.
