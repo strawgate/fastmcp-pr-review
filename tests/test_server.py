@@ -599,4 +599,3 @@ class TestMakePrFileReader:
         result = await reader("missing.py")
 
         assert result == ""
-
