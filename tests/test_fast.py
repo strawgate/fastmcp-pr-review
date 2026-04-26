@@ -16,8 +16,8 @@ from fastmcp_pr_review.models import (
 
 
 def _make_inp(**overrides: object) -> ReviewInput:
-    defaults = dict(
-        files=[
+    defaults: dict[str, object] = {
+        "files": [
             PRFile(
                 filename="src/main.py",
                 status="modified",
@@ -27,16 +27,16 @@ def _make_inp(**overrides: object) -> ReviewInput:
                 patch="+new\n-old",
             )
         ],
-        title="Test",
-        description="",
-        author="dev",
-        head_ref="feat",
-        base_ref="main",
-        additions=10,
-        deletions=5,
-        changed_files=1,
-    )
-    defaults.update(overrides)  # ty: ignore[no-matching-overload]
+        "title": "Test",
+        "description": "",
+        "author": "dev",
+        "head_ref": "feat",
+        "base_ref": "main",
+        "additions": 10,
+        "deletions": 5,
+        "changed_files": 1,
+    }
+    defaults.update(overrides)
     return ReviewInput(**defaults)  # ty: ignore[invalid-argument-type]
 
 
@@ -177,9 +177,7 @@ class TestBuildPrompt:
 
     def test_with_linked_issues(self) -> None:
         pipeline = FastReview()
-        prompt = pipeline.build_prompt(
-            _make_inp(linked_issues=["Issue #42: Fix the widget"])
-        )
+        prompt = pipeline.build_prompt(_make_inp(linked_issues=["Issue #42: Fix the widget"]))
         assert "Linked Issues" in prompt
         assert "Issue #42: Fix the widget" in prompt
 
@@ -206,14 +204,10 @@ class TestBuildPrompt:
 
     def test_with_stats(self) -> None:
         pipeline = FastReview()
-        prompt = pipeline.build_prompt(
-            _make_inp(additions=10, deletions=5, changed_files=2)
-        )
+        prompt = pipeline.build_prompt(_make_inp(additions=10, deletions=5, changed_files=2))
         assert "Stats:" in prompt
 
     def test_no_stats_all_zero(self) -> None:
         pipeline = FastReview()
-        prompt = pipeline.build_prompt(
-            _make_inp(additions=0, deletions=0, changed_files=0)
-        )
+        prompt = pipeline.build_prompt(_make_inp(additions=0, deletions=0, changed_files=0))
         assert "Stats:" not in prompt

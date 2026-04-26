@@ -128,6 +128,7 @@ class PRTimeline(BaseModel):
     pr: PRDetails
     events: list[TimelineEvent]
     files: list[PRFile]
+    commits: list[PRCommit] = Field(default_factory=list)
 
 
 # ── Source-agnostic review abstractions ────────────────────────────────────
@@ -169,6 +170,8 @@ class ReviewInput:
     # Thorough-mode context (empty for fast mode / non-PR sources):
     existing_threads: dict[str, list[PRReviewComment]] = field(default_factory=dict)
     prior_reviews: list[str] = field(default_factory=list)
+    # PR evolution context (commits, comments, reviews — for LLM awareness):
+    commits: list[PRCommit] = field(default_factory=list)
 
 
 # ── Review Output (shared by fast and thorough pipelines) ──────────────────

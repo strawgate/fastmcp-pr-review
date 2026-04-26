@@ -371,8 +371,7 @@ Rules:
             """List all files changed in this PR."""
             logger.debug("thorough: tool list_changed_files()")
             return "\n".join(
-                f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})"
-                for f in inp.files
+                f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in inp.files
             )
 
         return [get_file_contents, lookup_file_diff, list_changed_files]
@@ -532,9 +531,7 @@ Rules:
         # Format project context and linked issues
         project_section = ""
         if inp.project_context:
-            project_section = (
-                f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
-            )
+            project_section = f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
 
         issues_section = ""
         if inp.linked_issues:
@@ -547,9 +544,7 @@ Rules:
             )
 
         data = f"Intensity: {self.intensity}\n"
-        data += (
-            f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
-        )
+        data += f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
         if inp.description:
             data += f"Description: {inp.description}\n"
         if inp.focus_areas:
@@ -612,9 +607,7 @@ Rules:
             logger.warning("thorough: review batch failed: %s", exc)
 
         for f in findings:
-            logger.info(
-                "thorough: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title
-            )
+            logger.info("thorough: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title)
         return findings
 
     async def verify_findings(
@@ -684,8 +677,7 @@ Rules:
             """
             logger.info("thorough: DISMISSED %s — %s", title, reason[:80])
             return (
-                f"Dismissed '{title}'. Reason: {reason}. "
-                f"Move on to the next unprocessed finding."
+                f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
             )
 
         # --- Build compact finding list ---
@@ -700,10 +692,7 @@ Rules:
             )
 
         n = len(findings)
-        data = (
-            f"{inp.title} | @{inp.author}\n"
-            f"Verify {n} findings:\n\n" + "\n\n".join(finding_lines)
-        )
+        data = f"{inp.title} | @{inp.author}\nVerify {n} findings:\n\n" + "\n\n".join(finding_lines)
 
         exploration_tools = self.make_exploration_tools(inp, file_reader)
 
@@ -797,7 +786,8 @@ Rules:
             confirmed = await self.verify_findings(ctx, all_findings, inp, file_reader)
 
         return self.aggregate(
-            confirmed, total_files, len(reviewables),
+            confirmed,
+            total_files,
+            len(reviewables),
             files_prefiltered + files_filtered,
         )
-

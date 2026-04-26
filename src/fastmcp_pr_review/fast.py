@@ -83,9 +83,7 @@ Finding no issues is a valid outcome -- do not invent problems."""
     def build_prompt(self, inp: ReviewInput) -> str:
         """Build the user prompt from a ReviewInput. Override for custom format."""
         patches = "\n\n".join(
-            f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```"
-            for f in inp.files
-            if f.patch
+            f"### {f.filename} ({f.status})\n```diff\n{f.patch}\n```" for f in inp.files if f.patch
         )
         diff_context = patches or "(no patches available)"
 
@@ -107,8 +105,7 @@ Finding no issues is a valid outcome -- do not invent problems."""
             header_parts.append(inp.head_ref)
         if inp.additions or inp.deletions or inp.changed_files:
             header_parts.append(
-                f"Stats: +{inp.additions} -{inp.deletions} "
-                f"across {inp.changed_files} files"
+                f"Stats: +{inp.additions} -{inp.deletions} across {inp.changed_files} files"
             )
 
         prompt = (
