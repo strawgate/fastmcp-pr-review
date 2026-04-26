@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 from fastmcp_pr_review.models import (
     CommentCategory,
     FileReader,
+    PRReviewComment,
     PRReviewResult,
     ReviewComment,
     ReviewInput,
@@ -165,31 +166,9 @@ def _make_batches(
     """Group files into batches by size for review.
 
     Small files get batched together. Large files get their own batch.
+    Delegates to ThoroughReview._make_batches for the implementation.
     """
-    batches: list[list[DiffChunk]] = []
-    current: list[DiffChunk] = []
-    current_size = 0
-
-    for c in items:
-        patch_size = len(c.patch)
-
-        if patch_size > max_bytes:
-            if current:
-                batches.append(current)
-                current, current_size = [], 0
-            batches.append([c])
-            continue
-
-        if current_size + patch_size > max_bytes or len(current) >= max_items:
-            batches.append(current)
-            current, current_size = [], 0
-
-        current.append(c)
-        current_size += patch_size
-
-    if current:
-        batches.append(current)
-    return batches
+    return ThoroughReview._make_batches(items, max_items=max_items, max_bytes=max_bytes)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -341,6 +320,67 @@ Rules:
         self.filter_batch_size = filter_batch_size
         self.min_confidence = min_confidence
 
+    # -- Batching -----------------------------------------------------------
+
+    @staticmethod
+    def _make_batches(
+        items: list[DiffChunk],
+        *,
+        max_items: int = MAX_BATCH_ITEMS,
+        max_bytes: int = MAX_BATCH_BYTES,
+    ) -> list[list[DiffChunk]]:
+        """Group files into batches by size for review.
+
+        Small files get batched together. Large files get their own batch.
+        """
+        batches: list[list[DiffChunk]] = []
+        current: list[DiffChunk] = []
+        current_size = 0
+
+        for c in items:
+            patch_size = len(c.patch)
+
+            if patch_size > max_bytes:
+                if current:
+                    batches.append(current)
+                    current, current_size = [], 0
+                batches.append([c])
+                continue
+
+            if current_size + patch_size > max_bytes or len(current) >= max_items:
+                batches.append(current)
+                current, current_size = [], 0
+
+            current.append(c)
+            current_size += patch_size
+
+        if current:
+            batches.append(current)
+        return batches
+
+    # -- Prompt building helpers ---------------------------------------------
+
+    @staticmethod
+    def _format_file_section(
+        chunk: DiffChunk,
+        existing_threads: dict[str, list[PRReviewComment]],
+    ) -> str:
+        """Build a single <file_diff> section with existing thread context."""
+        existing = existing_threads.get(chunk.filename, [])
+        threads_text = "(none)"
+        if existing:
+            threads_text = "\n".join(
+                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
+            )
+        return (
+            f"<file_diff>\n"
+            f"File: {chunk.filename} ({chunk.status}, "
+            f"+{chunk.additions} -{chunk.deletions})\n"
+            f"```diff\n{chunk.patch}\n```\n"
+            f"Existing threads: {threads_text}\n"
+            f"</file_diff>"
+        )
+
     # -- Exploration tools --------------------------------------------------
 
     def make_exploration_tools(
@@ -359,7 +399,7 @@ Rules:
             logger.debug("thorough: tool get_file_contents(%s)", filepath)
             return await file_reader(filepath)
 
-        def lookup_file_diff(filename: str) -> str:
+        async def lookup_file_diff(filename: str) -> str:
             """See another file's diff from this PR."""
             logger.debug("thorough: tool lookup_file_diff(%s)", filename)
             for f in inp.files:
@@ -367,7 +407,7 @@ Rules:
                     return f.patch or "(no patch available)"
             return f"File '{filename}' not in this PR"
 
-        def list_changed_files() -> str:
+        async def list_changed_files() -> str:
             """List all files changed in this PR."""
             logger.debug("thorough: tool list_changed_files()")
             return "\n".join(
@@ -505,23 +545,9 @@ Rules:
         file_reader: FileReader,
     ) -> list[PotentialFinding]:
         """Review a batch of files. Findings collected via add_finding() tool calls."""
-        # Build per-file diff sections with existing threads
-        file_sections = []
-        for chunk in batch:
-            existing = inp.existing_threads.get(chunk.filename, [])
-            threads_text = "(none)"
-            if existing:
-                threads_text = "\n".join(
-                    f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
-                )
-            file_sections.append(
-                f"<file_diff>\n"
-                f"File: {chunk.filename} ({chunk.status}, "
-                f"+{chunk.additions} -{chunk.deletions})\n"
-                f"```diff\n{chunk.patch}\n```\n"
-                f"Existing threads: {threads_text}\n"
-                f"</file_diff>"
-            )
+        file_sections = [
+            self._format_file_section(chunk, inp.existing_threads) for chunk in batch
+        ]
 
         # Format prior review bodies (shared across batch)
         prior_section = "(none)"
@@ -550,6 +576,18 @@ Rules:
         if inp.focus_areas:
             data += f"Focus: {inp.focus_areas}\n"
         data += f"{project_section}{issues_section}\n"
+
+        commits_section = ""
+        if inp.commits:
+            msgs = [c.message.split("\n")[0] for c in inp.commits[:10]]
+            commits_section = f"<commits>\n{inp.title} has {len(inp.commits)} commits:\n"
+            for msg in msgs:
+                commits_section += f"  - {msg}\n"
+            if len(inp.commits) > 10:
+                commits_section += f"  ... and {len(inp.commits) - 10} more\n"
+            commits_section += "</commits>\n"
+        data += commits_section
+
         data += "\n\n".join(file_sections)
         if prior_section != "(none)":
             data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
