@@ -656,6 +656,10 @@ Rules:
 
         exploration_tools = self.make_exploration_tools(inp, file_reader)
 
+        # Static-first message ordering for KV cache efficiency:
+        # - system_prompt: identical every call → always cached
+        # - REVIEW_INSTRUCTIONS: identical every call → cached as second message
+        # - data (diffs, prior reviews, commits): varies per batch → cache break
         try:
             await ctx.sample(
                 messages=[self.REVIEW_INSTRUCTIONS, data],
