@@ -149,9 +149,7 @@ class TestVerifyFindings:
     async def test_calls_sample_with_finding_tools(self) -> None:
         """Verify pass should provide confirm/dismiss + exploration tools."""
         ctx = MagicMock()
-        ctx.sample = AsyncMock(
-            return_value=MagicMock(result=VerifyComplete(summary="Done"))
-        )
+        ctx.sample = AsyncMock(return_value=MagicMock(result=VerifyComplete(summary="Done")))
         pipeline = ThoroughReview(concurrency=1)
         inp = _make_inp()
 
@@ -217,9 +215,7 @@ class TestReviewFiles:
         from fastmcp_pr_review.thorough import DiffChunk
 
         ctx = MagicMock()
-        ctx.sample = AsyncMock(
-            return_value=MagicMock(result=ReviewDone(summary="Clean"))
-        )
+        ctx.sample = AsyncMock(return_value=MagicMock(result=ReviewDone(summary="Clean")))
         pipeline = ThoroughReview(concurrency=1)
         inp = _make_inp()
 
@@ -248,9 +244,7 @@ class TestReviewFiles:
         from fastmcp_pr_review.thorough import DiffChunk
 
         ctx = MagicMock()
-        ctx.sample = AsyncMock(
-            return_value=MagicMock(result=ReviewDone(summary="All clean"))
-        )
+        ctx.sample = AsyncMock(return_value=MagicMock(result=ReviewDone(summary="All clean")))
         pipeline = ThoroughReview(concurrency=1)
         inp = _make_inp()
 

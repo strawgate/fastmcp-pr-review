@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import click
@@ -17,6 +18,7 @@ from fastmcp_pr_review.github_client import GitHubPRClient
 from fastmcp_pr_review.models import (
     FileReader,
     PRFile,
+    PRReviewComment,
     PRReviewResult,
     PRTimeline,
     ReviewInput,
@@ -24,6 +26,34 @@ from fastmcp_pr_review.models import (
     TimelineEventType,
 )
 from fastmcp_pr_review.thorough import ThoroughReview
+
+
+def _build_review_context_from_events(
+    events: list[TimelineEvent],
+) -> tuple[dict[str, list[PRReviewComment]], list[str]]:
+    """Extract existing threads and prior review bodies from timeline events.
+
+    This is a pure function — easily tested without mocking the GitHub client.
+    """
+    existing_threads: dict[str, list[PRReviewComment]] = {}
+    prior_reviews: list[str] = []
+    for event in events:
+        if event.type == TimelineEventType.REVIEW_COMMENT and event.path:
+            existing_threads.setdefault(event.path, []).append(
+                PRReviewComment(
+                    id=0,
+                    author=event.author,
+                    body=event.body,
+                    path=event.path,
+                    diff_hunk=event.diff_hunk or "",
+                    line=event.line,
+                    created_at=event.timestamp or datetime.now(UTC),
+                )
+            )
+        elif event.type == TimelineEventType.REVIEW and event.body:
+            prior_reviews.append(event.body)
+    return existing_threads, prior_reviews
+
 
 if TYPE_CHECKING:
     from fastmcp.client.sampling import SamplingHandler
@@ -201,8 +231,6 @@ def create_server(
     async def _fetch_pr_context(
         repo: str,
         pr_number: int,
-        *,
-        focus_areas: str | None = None,
     ) -> tuple[PRTimeline, str, list[str]]:
         """Fetch PR timeline, project docs, and linked issues.
 
@@ -224,7 +252,8 @@ def create_server(
     ) -> ReviewInput:
         """Build a ReviewInput from PR data — fetches timeline, project docs, linked issues."""
         timeline, project_ctx, issues = await _fetch_pr_context(
-            repo, pr_number, focus_areas=focus_areas,
+            repo,
+            pr_number,
         )
         pr = timeline.pr
         return ReviewInput(
@@ -249,18 +278,20 @@ def create_server(
         *,
         focus_areas: str | None = None,
     ) -> tuple[ReviewInput, str]:
-        """Build ReviewInput with thorough-mode extras (threads, prior reviews).
+        """Build ReviewInput with thorough-mode extras (threads, prior reviews, commits).
 
-        Returns (ReviewInput, head_sha) so the caller can build a FileReader.
+        Derives existing_threads and prior_reviews from the timeline instead of
+        re-fetching — get_timeline() already has all the data.
         """
-        (timeline, project_ctx, issues), comments_by_file, prior_reviews = (
-            await asyncio.gather(
-                _fetch_pr_context(repo, pr_number, focus_areas=focus_areas),
-                gh.get_review_comments_by_file(repo, pr_number),
-                gh.get_prior_review_bodies(repo, pr_number),
-            )
-        )
+        timeline = await gh.get_timeline(repo, pr_number)
         pr = timeline.pr
+        project_ctx, issues = await asyncio.gather(
+            gather_project_context(gh, repo, pr.head_sha),
+            extract_linked_issues(gh, repo, pr.body, pr.head_ref),
+        )
+
+        existing_threads, prior_reviews = _build_review_context_from_events(timeline.events)
+
         inp = ReviewInput(
             files=timeline.files,
             title=pr.title,
@@ -275,8 +306,9 @@ def create_server(
             project_context=project_ctx,
             linked_issues=issues,
             focus_areas=focus_areas,
-            existing_threads=comments_by_file,
+            existing_threads=existing_threads,
             prior_reviews=prior_reviews,
+            commits=timeline.commits,
         )
         return inp, pr.head_sha
 
@@ -338,7 +370,9 @@ def create_server(
         if ctx is None:
             raise ValueError("Context is required for review tools")
         inp, head_sha = await _build_thorough_review_input(
-            repo, pr_number, focus_areas=focus_areas,
+            repo,
+            pr_number,
+            focus_areas=focus_areas,
         )
         file_reader = _make_pr_file_reader(repo, head_sha)
         pipeline = ThoroughReview(intensity=intensity)

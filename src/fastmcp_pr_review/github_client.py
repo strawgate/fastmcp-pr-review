@@ -270,7 +270,7 @@ class GitHubPRClient:
         # Sort by timestamp (None sorts first)
         events.sort(key=lambda e: (e.timestamp is None, e.timestamp))
 
-        return PRTimeline(pr=pr, events=events, files=files)
+        return PRTimeline(pr=pr, events=events, files=files, commits=commits)
 
     async def get_review_comments_by_file(
         self, repo: str, pr_number: int
@@ -288,7 +288,10 @@ class GitHubPRClient:
         return [r.body for r in reviews if r.body]
 
     async def get_file_contents(
-        self, repo: str, filepath: str, ref: str | None = None,
+        self,
+        repo: str,
+        filepath: str,
+        ref: str | None = None,
     ) -> str | None:
         """Get file contents at a specific git ref (defaults to repo's default branch).
 

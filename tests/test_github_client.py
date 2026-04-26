@@ -434,9 +434,7 @@ class TestGetFileContents:
         with patch.object(
             client._github.rest.repos, "async_get_content", new_callable=AsyncMock
         ) as mock_get:
-            mock_get.return_value = SimpleNamespace(
-                parsed_data=SimpleNamespace(content=encoded)
-            )
+            mock_get.return_value = SimpleNamespace(parsed_data=SimpleNamespace(content=encoded))
             result = await client.get_file_contents("owner/repo", "src/main.py", ref="abc123")
 
         assert result == "hello world"
@@ -476,9 +474,7 @@ class TestGetFileContents:
         with patch.object(
             client._github.rest.repos, "async_get_content", new_callable=AsyncMock
         ) as mock_get:
-            mock_get.return_value = SimpleNamespace(
-                parsed_data=SimpleNamespace(content=encoded)
-            )
+            mock_get.return_value = SimpleNamespace(parsed_data=SimpleNamespace(content=encoded))
             await client.get_file_contents("owner/repo", "f.py")
 
         mock_get.assert_awaited_once_with("owner", "repo", "f.py", ref=UNSET)

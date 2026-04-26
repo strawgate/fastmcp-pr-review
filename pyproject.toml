@@ -61,7 +61,13 @@ select = [
     "SIM",   # flake8-simplify
     "TCH",   # flake8-type-checking
     "RUF",   # ruff-specific
+    "C4",    # flake8-comprehensions
+    "PERF",  # perflint
+    "RET",   # flake8-return
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"src/fastmcp_pr_review/github_client.py" = ["PERF401"]  # async paginators can't use list comp
 
 [tool.ruff.lint.isort]
 known-first-party = ["fastmcp_pr_review"]

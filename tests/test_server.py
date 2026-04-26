@@ -15,10 +15,12 @@ from fastmcp_pr_review.models import (
     PRDetails,
     PRState,
     PRTimeline,
+    ReviewState,
     TimelineEvent,
     TimelineEventType,
 )
 from fastmcp_pr_review.server import (
+    _build_review_context_from_events,
     _format_timeline,
     _format_timeline_event,
     _parse_diff_to_files,
@@ -320,3 +322,92 @@ class TestToolRegistration:
             async with Client(server) as client:
                 result = await client.call_tool("get_pr_info", {"repo": "o/r", "pr_number": 1})
                 assert "PR #1: Test" in result.content[0].text
+
+
+class TestBuildReviewContextFromEvents:
+    """Tests for the pure function that extracts threads and reviews from timeline events."""
+
+    def test_empty_events(self) -> None:
+        threads, reviews = _build_review_context_from_events([])
+        assert threads == {}
+        assert reviews == []
+
+    def test_review_comment_creates_thread(self) -> None:
+        events = [
+            TimelineEvent(
+                type=TimelineEventType.REVIEW_COMMENT,
+                timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+                author=PRAuthor(login="reviewer"),
+                body="Consider this.",
+                path="src/main.py",
+                diff_hunk="@@ -1,3 +1,3 @@",
+                line=10,
+            )
+        ]
+        threads, reviews = _build_review_context_from_events(events)
+        assert "src/main.py" in threads
+        assert len(threads["src/main.py"]) == 1
+        assert threads["src/main.py"][0].body == "Consider this."
+        assert reviews == []
+
+    def test_review_creates_prior_review(self) -> None:
+        events = [
+            TimelineEvent(
+                type=TimelineEventType.REVIEW,
+                timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+                author=PRAuthor(login="reviewer"),
+                body="LGTM with nits.",
+                review_state=ReviewState.COMMENTED,
+            )
+        ]
+        threads, reviews = _build_review_context_from_events(events)
+        assert threads == {}
+        assert reviews == ["LGTM with nits."]
+
+    def test_skips_pr_opened_events(self) -> None:
+        events = [
+            TimelineEvent(
+                type=TimelineEventType.PR_OPENED,
+                timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+                author=PRAuthor(login="author"),
+                body="Initial PR",
+            )
+        ]
+        threads, reviews = _build_review_context_from_events(events)
+        assert threads == {}
+        assert reviews == []
+
+    def test_multiple_files_and_reviews(self) -> None:
+        events = [
+            TimelineEvent(
+                type=TimelineEventType.REVIEW_COMMENT,
+                timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+                author=PRAuthor(login="r1"),
+                body="Fix A.",
+                path="a.py",
+                line=1,
+            ),
+            TimelineEvent(
+                type=TimelineEventType.REVIEW_COMMENT,
+                timestamp=datetime(2025, 1, 2, tzinfo=UTC),
+                author=PRAuthor(login="r2"),
+                body="Fix B.",
+                path="b.py",
+                line=5,
+            ),
+            TimelineEvent(
+                type=TimelineEventType.REVIEW,
+                timestamp=datetime(2025, 1, 3, tzinfo=UTC),
+                author=PRAuthor(login="r1"),
+                body="First pass.",
+            ),
+            TimelineEvent(
+                type=TimelineEventType.REVIEW,
+                timestamp=datetime(2025, 1, 4, tzinfo=UTC),
+                author=PRAuthor(login="r2"),
+                body="Second pass.",
+            ),
+        ]
+        threads, reviews = _build_review_context_from_events(events)
+        assert list(threads.keys()) == ["a.py", "b.py"]
+        assert reviews == ["First pass.", "Second pass."]
