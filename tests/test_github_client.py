@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -423,3 +424,115 @@ class TestGetPriorReviewBodies:
             bodies = await client.get_prior_review_bodies("owner/repo", 42)
 
         assert bodies == ["LGTM", "Fix the bug"]
+
+
+class TestGetFileContents:
+    @pytest.mark.asyncio
+    async def test_returns_decoded_utf8(self) -> None:
+        client = GitHubPRClient("fake-token")
+        encoded = base64.b64encode(b"hello world").decode()
+        with patch.object(
+            client._github.rest.repos, "async_get_content", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                parsed_data=SimpleNamespace(content=encoded)
+            )
+            result = await client.get_file_contents("owner/repo", "src/main.py", ref="abc123")
+
+        assert result == "hello world"
+        mock_get.assert_awaited_once_with("owner", "repo", "src/main.py", ref="abc123")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_content_missing(self) -> None:
+        """Directory listings don't have a content attribute."""
+        client = GitHubPRClient("fake-token")
+        with patch.object(
+            client._github.rest.repos, "async_get_content", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                parsed_data=SimpleNamespace()  # no content attr
+            )
+            result = await client.get_file_contents("owner/repo", "src/")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_api_error(self) -> None:
+        client = GitHubPRClient("fake-token")
+        with patch.object(
+            client._github.rest.repos, "async_get_content", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.side_effect = Exception("404 Not Found")
+            result = await client.get_file_contents("owner/repo", "missing.py")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_passes_unset_when_no_ref(self) -> None:
+        from githubkit.utils import UNSET
+
+        client = GitHubPRClient("fake-token")
+        encoded = base64.b64encode(b"data").decode()
+        with patch.object(
+            client._github.rest.repos, "async_get_content", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                parsed_data=SimpleNamespace(content=encoded)
+            )
+            await client.get_file_contents("owner/repo", "f.py")
+
+        mock_get.assert_awaited_once_with("owner", "repo", "f.py", ref=UNSET)
+
+
+class TestGetIssue:
+    @pytest.mark.asyncio
+    async def test_returns_tuple(self) -> None:
+        client = GitHubPRClient("fake-token")
+        with patch.object(
+            client._github.rest.issues, "async_get", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                parsed_data=SimpleNamespace(title="Bug", state="open", body="Fix it")
+            )
+            result = await client.get_issue("owner/repo", 7)
+
+        assert result == ("Bug", "open", "Fix it")
+
+    @pytest.mark.asyncio
+    async def test_truncates_body_to_500(self) -> None:
+        client = GitHubPRClient("fake-token")
+        long_body = "a" * 1000
+        with patch.object(
+            client._github.rest.issues, "async_get", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                parsed_data=SimpleNamespace(title="T", state="open", body=long_body)
+            )
+            result = await client.get_issue("owner/repo", 1)
+
+        assert result is not None
+        assert len(result[2]) == 500
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_error(self) -> None:
+        client = GitHubPRClient("fake-token")
+        with patch.object(
+            client._github.rest.issues, "async_get", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.side_effect = Exception("404")
+            result = await client.get_issue("owner/repo", 999)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_handles_none_body(self) -> None:
+        client = GitHubPRClient("fake-token")
+        with patch.object(
+            client._github.rest.issues, "async_get", new_callable=AsyncMock
+        ) as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                parsed_data=SimpleNamespace(title="NB", state="closed", body=None)
+            )
+            result = await client.get_issue("owner/repo", 3)
+
+        assert result == ("NB", "closed", "")

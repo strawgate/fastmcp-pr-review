@@ -4,22 +4,52 @@
 
 ```
 src/fastmcp_pr_review/
-    models.py          Shared Pydantic models (PRReviewResult, ReviewComment, etc.)
+    models.py          Shared types: PRReviewResult, ReviewComment, ReviewInput, FileReader
     github_client.py   Async GitHub API wrapper using githubkit
-    server.py          FastMCP server — tool definitions, timeline formatting
-    fast.py            Fast single-shot review (structured output only)
-    thorough.py        Thorough pipeline (filter + review + verify)
+    server.py          FastMCP server — tool definitions, timeline formatting, data wiring
+    fast.py            FastReview class — single-shot structured review
+    thorough.py        ThoroughReview class — multi-pass pipeline (filter → review → verify)
+    context.py         Project context gathering (README, AGENTS.md, linked issues)
 
 tests/
     conftest.py          Shared fixtures (PR data models)
     test_models.py       Model validation, scoring helpers
     test_github_client.py  GitHub API wrapper (mocked)
-    test_server.py       Tool registration, timeline formatting
-    test_fast.py         fast review function
-    test_thorough.py     thorough pipeline stages
+    test_server.py       Tool registration, timeline formatting, diff parser
+    test_fast.py         FastReview class
+    test_thorough.py     ThoroughReview pipeline stages
 ```
 
-Each mode file defines its own stage-specific Pydantic models **inline** so the data flow is visible in one file. The shared `models.py` contains only types used by both modes: `PRReviewResult`, `ReviewComment`, `Severity`, `CommentCategory`, and scoring helpers (`compute_verdict`, `compute_scores`).
+### Architecture: Pipeline Classes
+
+The review system separates two orthogonal axes:
+
+- **Data source** — where the diff/files/context come from → `ReviewInput` + `FileReader` (in `models.py`)
+- **Review strategy** — how the review is performed → pipeline class with step methods
+
+`ReviewInput` is a frozen dataclass bundling everything the review logic needs (files, title, description, project context, etc.). `FileReader` is a Protocol for reading full file contents — different implementations for PRs (GitHub API), local repos (filesystem), or raw diffs (no-op).
+
+**FastReview** (`fast.py`): Single `ctx.sample()` call with structured output. Override `SYSTEM_PROMPT` or `build_prompt()` for variants.
+
+**ThoroughReview** (`thorough.py`): Multi-pass pipeline with overridable step methods:
+1. `prefilter()` — skip binary/generated files
+2. `filter_files()` — LLM classifies files as skip/review
+3. `review_files()` — batched review with tool calls
+4. `verify_findings()` — agentic verification with file exploration
+5. `aggregate()` — score and produce final result
+
+Each mode file is self-contained: prompts inline, stage models inline. They share only `models.py` types.
+
+### Extension Example
+
+```python
+class SecurityReview(ThoroughReview):
+    SYSTEM_PROMPT = "You are a security auditor..."
+    intensity = "aggressive"
+
+    async def filter_files(self, ctx, chunks, inp):
+        return chunks  # review everything
+```
 
 ## Commands
 
@@ -104,10 +134,10 @@ mcp = FastMCP(
 ## Adding a New Review Mode
 
 1. Create `src/fastmcp_pr_review/whatever.py`
-2. Define stage models inline at the top of the file
-3. Write the prompts inline (don't import from a shared prompts module)
-4. Export a top-level async function: `async def whatever_review(gh, ctx, repo, pr_number, ...) -> PRReviewResult`
-5. Register it as a tool in `server.py`
+2. Define a pipeline class (e.g. `WhateverReview`) — or subclass `FastReview`/`ThoroughReview`
+3. Define stage models and prompts inline in the file
+4. The class's `run()` method takes `(ctx, ReviewInput)` or `(ctx, ReviewInput, FileReader)` and returns `PRReviewResult`
+5. Register it as a tool in `server.py` — use `_build_review_input()` to construct input from PR data
 6. Add `tests/test_whatever.py`
 
 ## Dependencies

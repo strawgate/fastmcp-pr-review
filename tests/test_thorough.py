@@ -15,21 +15,19 @@ from fastmcp_pr_review.models import (
     PRState,
     PRTimeline,
     ReviewComment,
+    ReviewInput,
     ReviewState,
     Severity,
 )
 from fastmcp_pr_review.thorough import (
+    DiffChunk,
     FilterBatchResult,
     FilteredChunk,
     PotentialFinding,
     ReviewDone,
+    ThoroughReview,
     VerifyComplete,
-    _aggregate,
-    _prefilter,
-    _review_files,
-    _ReviewCtx,
-    _verify_findings,
-    thorough_review,
+    _make_batches,
 )
 
 
@@ -62,6 +60,22 @@ def _make_timeline() -> PRTimeline:
     )
 
 
+def _make_inp(timeline: PRTimeline | None = None) -> ReviewInput:
+    tl = timeline or _make_timeline()
+    pr = tl.pr
+    return ReviewInput(
+        files=tl.files,
+        title=pr.title,
+        description=pr.body or "",
+        author=pr.author.login,
+        head_ref=pr.head_ref,
+        base_ref=pr.base_ref,
+        additions=pr.additions,
+        deletions=pr.deletions,
+        changed_files=pr.changed_files,
+    )
+
+
 def _make_finding(confidence: int = 80) -> PotentialFinding:
     return PotentialFinding(
         path="src/main.py",
@@ -89,24 +103,8 @@ def _make_comment(confidence: int = 90) -> ReviewComment:
     )
 
 
-def _make_rctx(
-    gh: object | None = None,
-    ctx: object | None = None,
-    concurrency: int = 1,
-) -> _ReviewCtx:
-    if gh is None:
-        gh = MagicMock()
-        gh.get_file_contents = AsyncMock(return_value="contents")
-    if ctx is None:
-        ctx = MagicMock()
-        ctx.sample = AsyncMock()
-    return _ReviewCtx(
-        gh=gh,  # ty: ignore[invalid-argument-type]
-        ctx=ctx,  # ty: ignore[invalid-argument-type]
-        repo="o/r",
-        timeline=_make_timeline(),
-        concurrency=concurrency,
-    )
+async def _noop_file_reader(filepath: str) -> str:
+    return "contents"
 
 
 class TestPrefilter:
@@ -119,7 +117,8 @@ class TestPrefilter:
                 filename="b.bin", status="added", additions=0, deletions=0, changes=0, patch=None
             ),
         ]
-        assert len(_prefilter(files, max_files=50)) == 1
+        pipeline = ThoroughReview(max_files=50)
+        assert len(pipeline.prefilter(files)) == 1
 
     def test_skips_patterns(self) -> None:
         files = [
@@ -140,7 +139,8 @@ class TestPrefilter:
                 patch="+x",
             ),
         ]
-        chunks = _prefilter(files, max_files=50)
+        pipeline = ThoroughReview(max_files=50)
+        chunks = pipeline.prefilter(files)
         assert [c.filename for c in chunks] == ["src/main.py"]
 
 
@@ -148,14 +148,16 @@ class TestVerifyFindings:
     @pytest.mark.asyncio
     async def test_calls_sample_with_finding_tools(self) -> None:
         """Verify pass should provide confirm/dismiss + exploration tools."""
-        rctx = _make_rctx()
-        rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
+        ctx = MagicMock()
+        ctx.sample = AsyncMock(
             return_value=MagicMock(result=VerifyComplete(summary="Done"))
         )
+        pipeline = ThoroughReview(concurrency=1)
+        inp = _make_inp()
 
-        await _verify_findings(rctx, findings=[_make_finding()])
+        await pipeline.verify_findings(ctx, [_make_finding()], inp, _noop_file_reader)
 
-        call_kwargs = rctx.ctx.sample.call_args.kwargs  # ty: ignore[unresolved-attribute]
+        call_kwargs = ctx.sample.call_args.kwargs
         tool_names = [t.__name__ for t in call_kwargs["tools"]]
         assert "confirm_finding" in tool_names
         assert "dismiss_finding" in tool_names
@@ -164,42 +166,46 @@ class TestVerifyFindings:
 
     @pytest.mark.asyncio
     async def test_skips_empty_findings(self) -> None:
-        rctx = _make_rctx()
-        result = await _verify_findings(rctx, findings=[])
+        ctx = MagicMock()
+        ctx.sample = AsyncMock()
+        pipeline = ThoroughReview(concurrency=1)
+        inp = _make_inp()
+
+        result = await pipeline.verify_findings(ctx, [], inp, _noop_file_reader)
         assert result == []
-        rctx.ctx.sample.assert_not_awaited()  # ty: ignore[unresolved-attribute]
+        ctx.sample.assert_not_awaited()
 
 
 class TestAggregate:
     def test_with_confirmed_comments(self) -> None:
-        result = _aggregate(
+        pipeline = ThoroughReview(min_confidence=50)
+        result = pipeline.aggregate(
             [_make_comment()],
             total_files=1,
             files_reviewed=1,
             files_skipped=0,
-            min_confidence=50,
         )
         assert len(result.comments) == 1
 
     def test_empty_comments(self) -> None:
-        result = _aggregate(
+        pipeline = ThoroughReview(min_confidence=50)
+        result = pipeline.aggregate(
             [],
             total_files=1,
             files_reviewed=1,
             files_skipped=0,
-            min_confidence=50,
         )
         assert result.verdict == ReviewState.APPROVED
         assert len(result.comments) == 0
 
     def test_confidence_filter(self) -> None:
         low = _make_comment(confidence=30)
-        result = _aggregate(
+        pipeline = ThoroughReview(min_confidence=50)
+        result = pipeline.aggregate(
             [low],
             total_files=1,
             files_reviewed=1,
             files_skipped=0,
-            min_confidence=50,
         )
         assert len(result.comments) == 0
 
@@ -210,10 +216,12 @@ class TestReviewFiles:
         """Review pass should provide add_finding + exploration tools."""
         from fastmcp_pr_review.thorough import DiffChunk
 
-        rctx = _make_rctx()
-        rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
+        ctx = MagicMock()
+        ctx.sample = AsyncMock(
             return_value=MagicMock(result=ReviewDone(summary="Clean"))
         )
+        pipeline = ThoroughReview(concurrency=1)
+        inp = _make_inp()
 
         chunks = [
             DiffChunk(
@@ -225,9 +233,9 @@ class TestReviewFiles:
                 patch="+x",
             )
         ]
-        results = await _review_files(rctx, chunks=chunks)
+        results = await pipeline.review_files(ctx, chunks, inp, _noop_file_reader)
 
-        call_kwargs = rctx.ctx.sample.call_args.kwargs  # ty: ignore[unresolved-attribute]
+        call_kwargs = ctx.sample.call_args.kwargs
         tool_names = [t.__name__ for t in call_kwargs["tools"]]
         assert "add_finding" in tool_names
         assert "get_file_contents" in tool_names
@@ -239,10 +247,12 @@ class TestReviewFiles:
         """A clean batch should return no findings."""
         from fastmcp_pr_review.thorough import DiffChunk
 
-        rctx = _make_rctx()
-        rctx.ctx.sample = AsyncMock(  # ty: ignore[invalid-assignment]
+        ctx = MagicMock()
+        ctx.sample = AsyncMock(
             return_value=MagicMock(result=ReviewDone(summary="All clean"))
         )
+        pipeline = ThoroughReview(concurrency=1)
+        inp = _make_inp()
 
         chunks = [
             DiffChunk(
@@ -254,8 +264,79 @@ class TestReviewFiles:
                 patch="+y",
             )
         ]
-        results = await _review_files(rctx, chunks=chunks)
+        results = await pipeline.review_files(ctx, chunks, inp, _noop_file_reader)
         assert results == []
+
+
+class TestMakeBatches:
+    """Tests for the _make_batches batching helper."""
+
+    def _chunk(self, index: int, patch_size: int = 10) -> DiffChunk:
+        return DiffChunk(
+            index=index,
+            filename=f"f{index}.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            patch="x" * patch_size,
+        )
+
+    def test_empty_list(self) -> None:
+        assert _make_batches([]) == []
+
+    def test_single_small_item(self) -> None:
+        batches = _make_batches([self._chunk(0)])
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+
+    def test_multiple_items_under_limits(self) -> None:
+        items = [self._chunk(i, patch_size=10) for i in range(3)]
+        batches = _make_batches(items, max_items=10, max_bytes=1000)
+        assert len(batches) == 1
+        assert len(batches[0]) == 3
+
+    def test_exceeding_max_items(self) -> None:
+        items = [self._chunk(i, patch_size=5) for i in range(5)]
+        batches = _make_batches(items, max_items=2, max_bytes=10_000)
+        assert len(batches) == 3  # [0,1], [2,3], [4]
+        assert len(batches[0]) == 2
+        assert len(batches[1]) == 2
+        assert len(batches[2]) == 1
+
+    def test_single_oversized_item(self) -> None:
+        big = self._chunk(0, patch_size=500)
+        batches = _make_batches([big], max_items=10, max_bytes=100)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0].index == 0
+
+    def test_mix_normal_and_oversized(self) -> None:
+        items = [
+            self._chunk(0, patch_size=10),
+            self._chunk(1, patch_size=500),  # oversized
+            self._chunk(2, patch_size=10),
+        ]
+        batches = _make_batches(items, max_items=10, max_bytes=100)
+        # Batch 1: [chunk0], flushed before oversized
+        # Batch 2: [chunk1] (oversized, own batch)
+        # Batch 3: [chunk2]
+        assert len(batches) == 3
+        assert batches[0][0].index == 0
+        assert batches[1][0].index == 1
+        assert batches[2][0].index == 2
+
+    def test_boundary_exactly_at_max_items(self) -> None:
+        items = [self._chunk(i, patch_size=5) for i in range(3)]
+        batches = _make_batches(items, max_items=3, max_bytes=10_000)
+        assert len(batches) == 1
+        assert len(batches[0]) == 3
+
+    def test_one_more_than_max_items(self) -> None:
+        items = [self._chunk(i, patch_size=5) for i in range(4)]
+        batches = _make_batches(items, max_items=3, max_bytes=10_000)
+        assert len(batches) == 2
+        assert len(batches[0]) == 3
+        assert len(batches[1]) == 1
 
 
 class TestFullPipeline:
@@ -273,13 +354,9 @@ class TestFullPipeline:
             ]
         )
 
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_review_comments_by_file = AsyncMock(return_value={})
-        gh.get_prior_review_bodies = AsyncMock(return_value=[])
-        gh.get_file_contents = AsyncMock(return_value="contents")
-
-        result = await thorough_review(gh, ctx, "o/r", 1)
+        inp = _make_inp()
+        pipeline = ThoroughReview()
+        result = await pipeline.run(ctx, inp, _noop_file_reader)
 
         # filter (1 batch) + review (1 batch) = 2 calls
         # verify skipped because review found no findings
@@ -299,12 +376,9 @@ class TestFullPipeline:
             return_value=MagicMock(result=filter_result),
         )
 
-        gh = MagicMock()
-        gh.get_timeline = AsyncMock(return_value=_make_timeline())
-        gh.get_review_comments_by_file = AsyncMock(return_value={})
-        gh.get_prior_review_bodies = AsyncMock(return_value=[])
-
-        result = await thorough_review(gh, ctx, "o/r", 1)
+        inp = _make_inp()
+        pipeline = ThoroughReview()
+        result = await pipeline.run(ctx, inp, _noop_file_reader)
 
         # Only 1 call: the filter. No review or verify calls needed.
         assert ctx.sample.await_count == 1

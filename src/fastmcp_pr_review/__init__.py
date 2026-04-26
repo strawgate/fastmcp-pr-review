@@ -1,1 +1,1 @@
-"""FastMCP server for GitHub PR review with structured sampling."""
+"""FastMCP PR review package."""

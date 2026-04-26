@@ -21,6 +21,7 @@ from fastmcp_pr_review.models import (
 from fastmcp_pr_review.server import (
     _format_timeline,
     _format_timeline_event,
+    _parse_diff_to_files,
     cli,
     create_server,
 )
@@ -185,6 +186,92 @@ class TestCreateServer:
         cli_main.assert_called_once_with(standalone_mode=False)
 
 
+class TestParseDiffToFiles:
+    def test_single_modified_file(self) -> None:
+        diff = (
+            "diff --git a/src/main.py b/src/main.py\n"
+            "index abc..def 100644\n"
+            "--- a/src/main.py\n"
+            "+++ b/src/main.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " line1\n"
+            "-old\n"
+            "+new\n"
+            "+added\n"
+            " line3\n"
+        )
+        files = _parse_diff_to_files(diff)
+        assert len(files) == 1
+        assert files[0].filename == "src/main.py"
+        assert files[0].status == "modified"
+        assert files[0].additions == 2
+        assert files[0].deletions == 1
+
+    def test_new_file(self) -> None:
+        diff = (
+            "diff --git a/new.py b/new.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/new.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+hello\n"
+            "+world\n"
+        )
+        files = _parse_diff_to_files(diff)
+        assert len(files) == 1
+        assert files[0].status == "added"
+        assert files[0].additions == 2
+
+    def test_deleted_file(self) -> None:
+        diff = (
+            "diff --git a/old.py b/old.py\n"
+            "deleted file mode 100644\n"
+            "--- a/old.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,2 +0,0 @@\n"
+            "-bye\n"
+            "-world\n"
+        )
+        files = _parse_diff_to_files(diff)
+        assert len(files) == 1
+        assert files[0].status == "removed"
+        assert files[0].deletions == 2
+
+    def test_multiple_files(self) -> None:
+        diff = (
+            "diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "diff --git a/b.py b/b.py\n"
+            "--- a/b.py\n"
+            "+++ b/b.py\n"
+            "@@ -1 +1 @@\n"
+            "-x\n"
+            "+y\n"
+        )
+        files = _parse_diff_to_files(diff)
+        assert len(files) == 2
+        assert files[0].filename == "a.py"
+        assert files[1].filename == "b.py"
+
+    def test_empty_diff(self) -> None:
+        assert _parse_diff_to_files("") == []
+
+    def test_renamed_file(self) -> None:
+        diff = (
+            "diff --git a/old_name.py b/new_name.py\n"
+            "rename from old_name.py\n"
+            "rename to new_name.py\n"
+        )
+        files = _parse_diff_to_files(diff)
+        assert len(files) == 1
+        assert files[0].status == "renamed"
+        assert files[0].filename == "new_name.py"
+
+
 class TestToolRegistration:
     @pytest.fixture
     def server(self):
@@ -199,6 +286,7 @@ class TestToolRegistration:
             assert "get_pr_files" in names
             assert "review_pr_fast" in names
             assert "review_pr_thorough" in names
+            assert "review_diff_fast" in names
 
     @pytest.mark.asyncio
     async def test_get_pr_info(self, server) -> None:

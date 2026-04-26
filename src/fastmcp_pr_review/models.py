@@ -1,14 +1,17 @@
 """Shared Pydantic models for PR data, review output, and scoring.
 
-The fast and thorough review modules define their own stage-specific
-models inline so each mode stays self-contained. This module contains
-only the types shared across both modes.
+The thorough review module defines its own stage-specific models inline
+so it stays self-contained. This module contains only the types shared
+across both modes, plus the source-agnostic ``ReviewInput`` /
+``FileReader`` abstractions that decouple review logic from data sources.
 """
 
 from __future__ import annotations
 
-from datetime import datetime  # noqa: TC003
+from dataclasses import dataclass, field
+from datetime import datetime  # noqa: TC003 — Pydantic needs this at runtime
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import BaseModel, Field
 
@@ -127,7 +130,48 @@ class PRTimeline(BaseModel):
     files: list[PRFile]
 
 
-# ── Review Output (shared by all three v* implementations) ─────────────────
+# ── Source-agnostic review abstractions ────────────────────────────────────
+
+
+class FileReader(Protocol):
+    """Reads a file's contents — implementation varies by data source.
+
+    For PR reviews: ``gh.get_file_contents(repo, path, head_sha)``
+    For local diffs: read from working tree
+    For raw diffs: read from default branch
+    """
+
+    async def __call__(self, filepath: str) -> str: ...
+
+
+@dataclass(frozen=True)
+class ReviewInput:
+    """Source-agnostic bundle of everything the review pipeline needs.
+
+    Callers (server tools) construct this from whatever data source they
+    have — a GitHub PR, a raw diff, a local git worktree — and pass it
+    to a pipeline class (``FastReview``, ``ThoroughReview``).
+    """
+
+    files: list[PRFile]
+    title: str
+    description: str = ""
+    author: str = ""
+    pr_number: int | None = None
+    head_ref: str = ""
+    base_ref: str = ""
+    additions: int = 0
+    deletions: int = 0
+    changed_files: int = 0
+    project_context: str = ""
+    linked_issues: list[str] = field(default_factory=list)
+    focus_areas: str | None = None
+    # Thorough-mode context (empty for fast mode / non-PR sources):
+    existing_threads: dict[str, list[PRReviewComment]] = field(default_factory=dict)
+    prior_reviews: list[str] = field(default_factory=list)
+
+
+# ── Review Output (shared by fast and thorough pipelines) ──────────────────
 
 
 class Severity(StrEnum):
@@ -172,7 +216,7 @@ class ReviewStats(BaseModel):
 
 
 class PRReviewResult(BaseModel):
-    """Final output of any review pipeline. All three versions produce this."""
+    """Final output of any review pipeline."""
 
     verdict: ReviewState = Field(
         description="Overall verdict: APPROVED, CHANGES_REQUESTED, or COMMENTED"

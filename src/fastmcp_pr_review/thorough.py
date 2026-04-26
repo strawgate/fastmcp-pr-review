@@ -1,11 +1,15 @@
-"""Thorough PR review pipeline.
+"""Thorough class-based review pipeline.
 
-A multi-pass review system demonstrating advanced FastMCP patterns:
+A multi-pass review system:
 
-  Pass 1 — Context: Gather PR metadata, prior reviews, existing threads
-  Pass 2 — Filter: Batch-classify files as skip/review (structured output)
-  Pass 3 — Review: Batched review with tool-based finding collection
-  Pass 4 — Verify: Single agentic call to confirm/disprove findings
+  Pass 1 — Prefilter: Skip binary/generated files (sync, pattern-based)
+  Pass 2 — Filter:    Batch-classify files as skip/review (structured output)
+  Pass 3 — Review:    Batched review with tool-based finding collection
+  Pass 4 — Verify:    Single agentic call to confirm/disprove findings
+
+The ``ThoroughReview`` class decouples the pipeline from data sources.
+Callers build a ``ReviewInput`` and supply a ``FileReader`` — the same
+pipeline works for PR data, raw diffs, or local worktree diffs.
 
 Key patterns in thorough mode:
   - Prior review awareness (don't repeat what's already been said)
@@ -22,7 +26,6 @@ import asyncio
 import fnmatch
 import logging
 from collections import Counter
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import logfire
@@ -30,8 +33,10 @@ from pydantic import BaseModel, Field
 
 from fastmcp_pr_review.models import (
     CommentCategory,
+    FileReader,
     PRReviewResult,
     ReviewComment,
+    ReviewInput,
     ReviewStats,
     Severity,
     compute_scores,
@@ -43,8 +48,7 @@ if TYPE_CHECKING:
 
     from fastmcp import Context
 
-    from fastmcp_pr_review.github_client import GitHubPRClient
-    from fastmcp_pr_review.models import PRFile, PRReviewComment, PRTimeline
+    from fastmcp_pr_review.models import PRFile
 
 logger = logging.getLogger(__name__)
 
@@ -58,32 +62,6 @@ SKIP_PATTERNS = [
     "vendor/*", "node_modules/*", "dist/*", "build/*",
     "__pycache__/*", "*.pyc", "*.png", "*.jpg", "*.svg", "*.ico",
 ]  # fmt: skip
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Review context — bundles shared state passed through the pipeline
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(frozen=True)
-class _ReviewCtx:
-    """Shared state passed through the review and verify passes.
-
-    Bundles PR data, GitHub client, sampling context, and review settings
-    so each function takes one `rctx` argument instead of 10+ params.
-    """
-
-    gh: GitHubPRClient
-    ctx: Context
-    repo: str
-    timeline: PRTimeline
-    existing_threads: dict[str, list[PRReviewComment]] = field(default_factory=dict)
-    prior_reviews: list[str] = field(default_factory=list)
-    focus_areas: str | None = None
-    intensity: str = "balanced"
-    concurrency: int = 3
-    project_context: str = ""
-    linked_issues: list[str] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -157,53 +135,77 @@ class VerifyComplete(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Exploration tools — shared by review and verify passes
+# Pass 3: Review — batch model and batching helper
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _make_exploration_tools(
-    gh: GitHubPRClient,
-    timeline: PRTimeline,
-    repo: str,
-) -> list[Callable[..., object]]:
-    """Build exploration tools shared by the review and verify passes.
+class ReviewDone(BaseModel):
+    """Trivial result_type for review — signals the batch is complete.
 
-    These let the LLM read files, check diffs, and list changed files
-    during its tool-calling loop.
+    Findings are collected via add_finding() tool calls during the loop.
     """
-    pr = timeline.pr
-    all_files = timeline.files
 
-    async def get_file_contents(filepath: str) -> str:
-        """Read any file in the repo at the PR's head ref."""
-        logger.debug("thorough: tool get_file_contents(%s)", filepath)
-        return await gh.get_file_contents(repo, filepath, pr.head_sha)
+    summary: str = Field(description="Brief summary of review results")
 
-    def lookup_file_diff(filename: str) -> str:
-        """See another file's diff from this PR."""
-        logger.debug("thorough: tool lookup_file_diff(%s)", filename)
-        for f in all_files:
-            if f.filename == filename:
-                return f.patch or "(no patch available)"
-        return f"File '{filename}' not in this PR"
 
-    def list_changed_files() -> str:
-        """List all files changed in this PR."""
-        logger.debug("thorough: tool list_changed_files()")
-        return "\n".join(
-            f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})" for f in all_files
-        )
+# ---------------------------------------------------------------------------
+# Batching — group files by total patch size
+# ---------------------------------------------------------------------------
 
-    return [get_file_contents, lookup_file_diff, list_changed_files]
+MAX_BATCH_ITEMS = 10
+MAX_BATCH_BYTES = 10_000
+
+
+def _make_batches(
+    items: list[DiffChunk],
+    *,
+    max_items: int = MAX_BATCH_ITEMS,
+    max_bytes: int = MAX_BATCH_BYTES,
+) -> list[list[DiffChunk]]:
+    """Group files into batches by size for review.
+
+    Small files get batched together. Large files get their own batch.
+    """
+    batches: list[list[DiffChunk]] = []
+    current: list[DiffChunk] = []
+    current_size = 0
+
+    for c in items:
+        patch_size = len(c.patch)
+
+        if patch_size > max_bytes:
+            if current:
+                batches.append(current)
+                current, current_size = [], 0
+            batches.append([c])
+            continue
+
+        if current_size + patch_size > max_bytes or len(current) >= max_items:
+            batches.append(current)
+            current, current_size = [], 0
+
+        current.append(c)
+        current_size += patch_size
+
+    if current:
+        batches.append(current)
+    return batches
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Prompts
+# ThoroughReview pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
-# -- Layer 1: System prompt (cached across ALL calls, all modes, all PRs) --
 
-SYSTEM_PROMPT = """\
+class ThoroughReview:
+    """Multi-pass review pipeline: filter → review → verify.
+
+    Override any step method or prompt for custom behavior.
+    """
+
+    # -- Prompts (class attributes — override in subclasses) ----------------
+
+    SYSTEM_PROMPT = """\
 You are an expert code reviewer. You think like a senior engineer doing a \
 real code review: you read the diff, understand the intent, trace data flow, \
 and only speak up when something is genuinely wrong.
@@ -271,10 +273,7 @@ Finding zero issues is better than findings that waste time.
 Call MULTIPLE tools in a single turn. Batch 3-5 tool calls per turn. \
 When done, include final_response in the same turn as your last tool call."""
 
-
-# -- Layer 2: Static per-mode instructions (cached per mode across all PRs) --
-
-FILTER_INSTRUCTIONS = """\
+    FILTER_INSTRUCTIONS = """\
 MODE: FILTER — Triage files for code review.
 
 For each file, decide: skip or review. Set skip=true ONLY for files with \
@@ -287,8 +286,7 @@ zero code review value:
 Everything else gets reviewed. Most files should NOT be skipped. \
 Output minimal JSON — keep skip reasons under 10 words."""
 
-
-REVIEW_INSTRUCTIONS = """\
+    REVIEW_INSTRUCTIONS = """\
 MODE: REVIEW — Find real bugs in pull request diffs.
 
 Call add_finding(filename, ...) for each real issue you find. Use exploration \
@@ -309,8 +307,7 @@ Intensity levels (the message will specify which):
   balanced: flag medium+ confidence, lean toward silence when ambiguous
   aggressive: flag everything noticed, still require evidence for each"""
 
-
-VERIFY_INSTRUCTIONS = """\
+    VERIFY_INSTRUCTIONS = """\
 MODE: VERIFY — Confirm or disprove suspected code review findings.
 
 You will receive a list of findings from the review pass. For each one:
@@ -327,576 +324,480 @@ Rules:
 - When confirming, provide evidence and an updated confidence score
 - Dismissing a weak finding is always better than confirming it"""
 
+    # -- Constructor --------------------------------------------------------
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main entry point
-# ═══════════════════════════════════════════════════════════════════════════
+    def __init__(
+        self,
+        *,
+        intensity: str = "balanced",
+        concurrency: int = 3,
+        max_files: int = 50,
+        filter_batch_size: int = 10,
+        min_confidence: int = 50,
+    ) -> None:
+        self.intensity = intensity
+        self.concurrency = concurrency
+        self.max_files = max_files
+        self.filter_batch_size = filter_batch_size
+        self.min_confidence = min_confidence
 
+    # -- Exploration tools --------------------------------------------------
 
-async def thorough_review(
-    gh: GitHubPRClient,
-    ctx: Context,
-    repo: str,
-    pr_number: int,
-    *,
-    focus_areas: str | None = None,
-    intensity: str = "balanced",
-    max_files: int = 50,
-    filter_batch_size: int = 10,
-    concurrency: int = 3,
-    min_confidence: int = 50,
-    project_context: str = "",
-    linked_issues: list[str] | None = None,
-) -> PRReviewResult:
-    """Thorough PR review pipeline: Context -> Filter -> Review -> Verify.
+    def make_exploration_tools(
+        self,
+        inp: ReviewInput,
+        file_reader: FileReader,
+    ) -> list[Callable[..., object]]:
+        """Build exploration tools shared by the review and verify passes.
 
-    Four passes:
-      1. Context — fetch PR timeline, prior reviews, existing threads
-      2. Filter — batch-classify files as skip/review (cheap, no tools)
-      3. Review — batched review with add_finding() tool calls
-      4. Verify — single agentic call to confirm/disprove findings
-    """
+        These let the LLM read files, check diffs, and list changed files
+        during its tool-calling loop.
+        """
 
-    with logfire.span(
-        "thorough_review {repo}#{pr_number}",
-        repo=repo,
-        pr_number=pr_number,
-        intensity=intensity,
-    ):
-        return await _thorough_review_inner(
-            gh,
-            ctx,
-            repo,
-            pr_number,
-            focus_areas=focus_areas,
-            intensity=intensity,
-            max_files=max_files,
-            filter_batch_size=filter_batch_size,
-            concurrency=concurrency,
-            min_confidence=min_confidence,
-            project_context=project_context,
-            linked_issues=linked_issues,
-        )
+        async def get_file_contents(filepath: str) -> str:
+            """Read any file in the repo at the PR's head ref."""
+            logger.debug("thorough: tool get_file_contents(%s)", filepath)
+            return await file_reader(filepath)
 
+        def lookup_file_diff(filename: str) -> str:
+            """See another file's diff from this PR."""
+            logger.debug("thorough: tool lookup_file_diff(%s)", filename)
+            for f in inp.files:
+                if f.filename == filename:
+                    return f.patch or "(no patch available)"
+            return f"File '{filename}' not in this PR"
 
-async def _thorough_review_inner(
-    gh: GitHubPRClient,
-    ctx: Context,
-    repo: str,
-    pr_number: int,
-    *,
-    focus_areas: str | None,
-    intensity: str,
-    max_files: int,
-    filter_batch_size: int,
-    concurrency: int,
-    min_confidence: int,
-    project_context: str,
-    linked_issues: list[str] | None,
-) -> PRReviewResult:
-    with logfire.span("pass 1: context"):
-        timeline, comments_by_file, prior_reviews = await asyncio.gather(
-            gh.get_timeline(repo, pr_number),
-            gh.get_review_comments_by_file(repo, pr_number),
-            gh.get_prior_review_bodies(repo, pr_number),
-        )
-
-    total_files = len(timeline.files)
-    logfire.info(
-        "context: {files} files, {threads} threads, {reviews} prior reviews",
-        files=total_files,
-        threads=sum(len(v) for v in comments_by_file.values()),
-        reviews=len(prior_reviews),
-    )
-
-    # Pre-filter: skip binary/generated files (no LLM needed)
-    chunks = _prefilter(timeline.files, max_files)
-    files_prefiltered = total_files - len(chunks)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # PASS 2: Filter — classify files as skip/review (no tools)
-    # ═══════════════════════════════════════════════════════════════════
-
-    with logfire.span("pass 2: filter", files=len(chunks)):
-        reviewables = await _filter_files(ctx, chunks, timeline, filter_batch_size)
-        files_filtered = len(chunks) - len(reviewables)
-        logfire.info(
-            "filter done: {reviewable} reviewable, {filtered} filtered",
-            reviewable=len(reviewables),
-            filtered=files_filtered,
-        )
-
-    # ═══════════════════════════════════════════════════════════════════
-    # PASS 3: Review — batched review with tool-based finding collection
-    # ═══════════════════════════════════════════════════════════════════
-
-    rctx = _ReviewCtx(
-        gh=gh,
-        ctx=ctx,
-        repo=repo,
-        timeline=timeline,
-        existing_threads=comments_by_file,
-        prior_reviews=prior_reviews,
-        focus_areas=focus_areas,
-        intensity=intensity,
-        concurrency=concurrency,
-        project_context=project_context,
-        linked_issues=linked_issues or [],
-    )
-
-    with logfire.span("pass 3: review", files=len(reviewables), concurrency=concurrency):
-        all_findings = await _review_files(rctx, chunks=reviewables)
-        logfire.info("{n} potential findings", n=len(all_findings))
-
-    # ═══════════════════════════════════════════════════════════════════
-    # PASS 4: Verify — single agentic call with exploration tools
-    # ═══════════════════════════════════════════════════════════════════
-
-    with logfire.span("pass 4: verify", findings=len(all_findings)):
-        confirmed_comments = await _verify_findings(rctx, findings=all_findings)
-        logfire.info("{n} confirmed", n=len(confirmed_comments))
-
-    # Aggregate
-    result = _aggregate(
-        confirmed_comments,
-        total_files,
-        len(reviewables),
-        files_prefiltered + files_filtered,
-        min_confidence,
-    )
-    logger.info("thorough: done — %s, %d comments", result.verdict, len(result.comments))
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Pass 2: Filter
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _prefilter(files: list[PRFile], max_files: int) -> list[DiffChunk]:
-    """Drop binary/generated files and convert to DiffChunks for the pipeline.
-
-    Skips files with no patch (binary) or matching SKIP_PATTERNS (generated).
-    Returns at most max_files chunks, sorted largest-first.
-    """
-
-    def should_skip(f: PRFile) -> bool:
-        if f.patch is None:
-            return True
-        return any(fnmatch.fnmatch(f.filename, p) for p in SKIP_PATTERNS)
-
-    chunks = [
-        DiffChunk(
-            index=i,
-            filename=f.filename,
-            status=f.status,
-            additions=f.additions,
-            deletions=f.deletions,
-            patch=f.patch or "",
-        )
-        for i, f in enumerate(files)
-        if not should_skip(f)
-    ]
-    chunks.sort(key=lambda c: c.additions + c.deletions, reverse=True)
-    return chunks[:max_files]
-
-
-async def _filter_files(
-    ctx: Context,
-    chunks: list[DiffChunk],
-    timeline: PRTimeline,
-    batch_size: int,
-) -> list[DiffChunk]:
-    """Batch-classify files. Returns chunks that should be reviewed."""
-    if not chunks:
-        return []
-
-    pr = timeline.pr
-    batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
-
-    async def filter_batch(batch: list[DiffChunk]) -> FilterBatchResult:
-        chunk_texts = []
-        for c in batch:
-            preview = c.patch[:1500]
-            if len(c.patch) > 1500:
-                preview += f"\n... ({len(c.patch) - 1500} chars truncated)"
-            chunk_texts.append(
-                f'<chunk index="{c.index}">\n'
-                f"File: {c.filename} ({c.status}, +{c.additions} -{c.deletions})\n"
-                f"```diff\n{preview}\n```\n</chunk>"
+        def list_changed_files() -> str:
+            """List all files changed in this PR."""
+            logger.debug("thorough: tool list_changed_files()")
+            return "\n".join(
+                f"  {f.status:>10} {f.filename} (+{f.additions} -{f.deletions})"
+                for f in inp.files
             )
 
+        return [get_file_contents, lookup_file_diff, list_changed_files]
+
+    # -- Pipeline steps -----------------------------------------------------
+
+    def prefilter(self, files: list[PRFile]) -> list[DiffChunk]:
+        """Drop binary/generated files and convert to DiffChunks for the pipeline.
+
+        Skips files with no patch (binary) or matching SKIP_PATTERNS (generated).
+        Returns at most max_files chunks, sorted largest-first.
+        """
+
+        def should_skip(f: PRFile) -> bool:
+            if f.patch is None:
+                return True
+            return any(fnmatch.fnmatch(f.filename, p) for p in SKIP_PATTERNS)
+
+        chunks = [
+            DiffChunk(
+                index=i,
+                filename=f.filename,
+                status=f.status,
+                additions=f.additions,
+                deletions=f.deletions,
+                patch=f.patch or "",
+            )
+            for i, f in enumerate(files)
+            if not should_skip(f)
+        ]
+        chunks.sort(key=lambda c: c.additions + c.deletions, reverse=True)
+        return chunks[: self.max_files]
+
+    async def filter_files(
+        self,
+        ctx: Context,
+        chunks: list[DiffChunk],
+        inp: ReviewInput,
+    ) -> list[DiffChunk]:
+        """Batch-classify files. Returns chunks that should be reviewed."""
+        if not chunks:
+            return []
+
+        batches = [
+            chunks[i : i + self.filter_batch_size]
+            for i in range(0, len(chunks), self.filter_batch_size)
+        ]
+
+        async def filter_batch(batch: list[DiffChunk]) -> FilterBatchResult:
+            chunk_texts = []
+            for c in batch:
+                preview = c.patch[:1500]
+                if len(c.patch) > 1500:
+                    preview += f"\n... ({len(c.patch) - 1500} chars truncated)"
+                chunk_texts.append(
+                    f'<chunk index="{c.index}">\n'
+                    f"File: {c.filename} ({c.status}, +{c.additions} -{c.deletions})\n"
+                    f"```diff\n{preview}\n```\n</chunk>"
+                )
+
+            data = (
+                f"{inp.title} | @{inp.author} | "
+                f"{inp.head_ref} -> {inp.base_ref}\n"
+                f"Classify {len(batch)} files:\n\n" + "\n\n".join(chunk_texts)
+            )
+
+            try:
+                r = await ctx.sample(
+                    messages=[self.FILTER_INSTRUCTIONS, data],
+                    system_prompt=self.SYSTEM_PROMPT,
+                    result_type=FilterBatchResult,
+                    temperature=0.1,
+                    max_tokens=8192,
+                )
+                return r.result
+            except Exception as exc:
+                logger.warning("thorough: filter batch failed: %s", exc)
+                # On failure, don't skip any files — let them through to review
+                return FilterBatchResult(
+                    chunks=[FilteredChunk(index=c.index, skip=False) for c in batch]
+                )
+
+        # All batches run concurrently
+        results = await asyncio.gather(*(filter_batch(b) for b in batches))
+
+        # Keep only chunks not marked for skipping
+        chunk_by_idx = {c.index: c for c in chunks}
+        reviewable: list[DiffChunk] = []
+        for br in results:
+            for fc in br.chunks:
+                if fc.skip:
+                    chunk = chunk_by_idx.get(fc.index)
+                    name = chunk.filename if chunk else f"index={fc.index}"
+                    logger.debug("thorough: filter skipped %s — %s", name, fc.reason)
+                    continue
+                chunk = chunk_by_idx.get(fc.index)
+                if chunk:
+                    reviewable.append(chunk)
+
+        return reviewable
+
+    async def review_files(
+        self,
+        ctx: Context,
+        chunks: list[DiffChunk],
+        inp: ReviewInput,
+        file_reader: FileReader,
+    ) -> list[PotentialFinding]:
+        """Review files in batches. Returns flat list of findings."""
+        if not chunks:
+            return []
+
+        batches = _make_batches(chunks)
+        logger.info("thorough: %d files -> %d review batches", len(chunks), len(batches))
+
+        sem = asyncio.Semaphore(self.concurrency)
+
+        async def review(batch: list[DiffChunk]) -> list[PotentialFinding]:
+            async with sem:
+                return await self._review_batch(ctx, batch=batch, inp=inp, file_reader=file_reader)
+
+        results = await asyncio.gather(*(review(b) for b in batches))
+        return [f for batch_results in results for f in batch_results]
+
+    async def _review_batch(
+        self,
+        ctx: Context,
+        *,
+        batch: list[DiffChunk],
+        inp: ReviewInput,
+        file_reader: FileReader,
+    ) -> list[PotentialFinding]:
+        """Review a batch of files. Findings collected via add_finding() tool calls."""
+        # Build per-file diff sections with existing threads
+        file_sections = []
+        for chunk in batch:
+            existing = inp.existing_threads.get(chunk.filename, [])
+            threads_text = "(none)"
+            if existing:
+                threads_text = "\n".join(
+                    f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
+                )
+            file_sections.append(
+                f"<file_diff>\n"
+                f"File: {chunk.filename} ({chunk.status}, "
+                f"+{chunk.additions} -{chunk.deletions})\n"
+                f"```diff\n{chunk.patch}\n```\n"
+                f"Existing threads: {threads_text}\n"
+                f"</file_diff>"
+            )
+
+        # Format prior review bodies (shared across batch)
+        prior_section = "(none)"
+        if inp.prior_reviews:
+            prior_section = "\n---\n".join(body[:300] for body in inp.prior_reviews[:3])
+
+        # Format project context and linked issues
+        project_section = ""
+        if inp.project_context:
+            project_section = (
+                f"\n<project_context>\n{inp.project_context}\n</project_context>\n"
+            )
+
+        issues_section = ""
+        if inp.linked_issues:
+            issues_text = "\n\n".join(inp.linked_issues)
+            issues_section = (
+                f"\n<linked_issues>\n"
+                f"Review against these requirements:\n"
+                f"{issues_text}\n"
+                f"</linked_issues>\n"
+            )
+
+        data = f"Intensity: {self.intensity}\n"
+        data += (
+            f"{inp.title} | @{inp.author} | {inp.head_ref} -> {inp.base_ref}\n"
+        )
+        if inp.description:
+            data += f"Description: {inp.description}\n"
+        if inp.focus_areas:
+            data += f"Focus: {inp.focus_areas}\n"
+        data += f"{project_section}{issues_section}\n"
+        data += "\n\n".join(file_sections)
+        if prior_section != "(none)":
+            data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
+
+        # --- State that accumulates via tool calls ---
+        findings: list[PotentialFinding] = []
+
+        def add_finding(
+            filename: str,
+            title: str,
+            body: str,
+            why: str,
+            verification_needs: str,
+            severity: str = "medium",
+            category: str = "bug",
+            line: int | None = None,
+            end_line: int | None = None,
+            suggested_code: str | None = None,
+            confidence: int = 70,
+        ) -> str:
+            """Report a code review finding.
+
+            Call this for each issue you find. Provide all required fields.
+            Only call this for issues you've verified through the protocol.
+            """
+            findings.append(
+                PotentialFinding(
+                    path=filename,
+                    line=line,
+                    end_line=end_line,
+                    severity=Severity(severity),
+                    category=CommentCategory(category),
+                    title=title,
+                    body=body,
+                    why=why,
+                    suggested_code=suggested_code,
+                    confidence=confidence,
+                    verification_needs=verification_needs,
+                )
+            )
+            return f"Finding recorded: '{title}'. Continue reviewing or complete."
+
+        exploration_tools = self.make_exploration_tools(inp, file_reader)
+
+        try:
+            await ctx.sample(
+                messages=[self.REVIEW_INSTRUCTIONS, data],
+                system_prompt=self.SYSTEM_PROMPT,
+                result_type=ReviewDone,
+                tools=[add_finding, *exploration_tools],
+                temperature=0.2,
+                max_tokens=8192,
+            )
+        except Exception as exc:
+            logger.warning("thorough: review batch failed: %s", exc)
+
+        for f in findings:
+            logger.info(
+                "thorough: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title
+            )
+        return findings
+
+    async def verify_findings(
+        self,
+        ctx: Context,
+        findings: list[PotentialFinding],
+        inp: ReviewInput,
+        file_reader: FileReader,
+    ) -> list[ReviewComment]:
+        """Verify all findings in one agentic ctx.sample() call.
+
+        The LLM gets a compact list (file:line + reason) and exploration
+        tools. It calls confirm_finding() or dismiss_finding() for each.
+        One call, minimal prompt, tools do the heavy lifting.
+        """
+        if not findings:
+            return []
+
+        # --- State that accumulates across the tool loop ---
+        confirmed: list[ReviewComment] = []
+
+        # --- Finding management tools ---
+
+        def confirm_finding(
+            title: str,
+            evidence: str,
+            path: str,
+            line: int | None = None,
+            severity: str = "medium",
+            category: str = "bug",
+            body: str = "",
+            why: str = "",
+            suggested_code: str | None = None,
+            confidence: int = 80,
+        ) -> str:
+            """Confirm a finding is real and add it to the review.
+
+            Call this when your investigation confirms the issue exists.
+            Provide the evidence you found and an updated confidence score.
+            """
+            logger.info("thorough: CONFIRMED [%s] %s:%s — %s", severity, path, line, title)
+            confirmed.append(
+                ReviewComment(
+                    path=path,
+                    line=line,
+                    severity=Severity(severity),
+                    category=CommentCategory(category),
+                    title=title,
+                    body=body or f"Confirmed: {title}",
+                    why=why or evidence,
+                    suggested_code=suggested_code,
+                    confidence=confidence,
+                )
+            )
+            already = [c.title for c in confirmed]
+            return (
+                f"Confirmed '{title}' (confidence={confidence}). "
+                f"Already confirmed: {already}. "
+                f"Move on to the next unprocessed finding."
+            )
+
+        def dismiss_finding(title: str, reason: str) -> str:
+            """Dismiss a finding — it's not a real issue.
+
+            Call this when your investigation shows the issue doesn't exist,
+            is handled elsewhere, or is inconclusive.
+            """
+            logger.info("thorough: DISMISSED %s — %s", title, reason[:80])
+            return (
+                f"Dismissed '{title}'. Reason: {reason}. "
+                f"Move on to the next unprocessed finding."
+            )
+
+        # --- Build compact finding list ---
+        finding_lines = []
+        for i, f in enumerate(findings):
+            finding_lines.append(
+                f'<finding index="{i}">\n'
+                f"{f.path}:{f.line or '?'} -- {f.title}\n"
+                f"{f.body}\n"
+                f"Verify: {f.verification_needs}\n"
+                f"</finding>"
+            )
+
+        n = len(findings)
         data = (
-            f"PR #{pr.number}: {pr.title} | @{pr.author.login} | "
-            f"{pr.head_ref} -> {pr.base_ref}\n"
-            f"Classify {len(batch)} files:\n\n" + "\n\n".join(chunk_texts)
+            f"{inp.title} | @{inp.author}\n"
+            f"Verify {n} findings:\n\n" + "\n\n".join(finding_lines)
         )
 
-        r = await ctx.sample(
-            messages=[FILTER_INSTRUCTIONS, data],
-            system_prompt=SYSTEM_PROMPT,
-            result_type=FilterBatchResult,
-            temperature=0.1,
-            max_tokens=8192,
-        )
-        return r.result
+        exploration_tools = self.make_exploration_tools(inp, file_reader)
 
-    # All batches run concurrently
-    results = await asyncio.gather(*(filter_batch(b) for b in batches))
-
-    # Keep only chunks not marked for skipping
-    chunk_by_idx = {c.index: c for c in chunks}
-    reviewable: list[DiffChunk] = []
-    for br in results:
-        for fc in br.chunks:
-            if fc.skip:
-                skipped = chunk_by_idx.get(fc.index, fc.index)
-                logger.debug("thorough: filter skipped %s — %s", skipped, fc.reason)
-                continue
-            chunk = chunk_by_idx.get(fc.index)
-            if chunk:
-                reviewable.append(chunk)
-
-    return reviewable
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Pass 3: Review (batched, tool-based finding collection)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class ReviewDone(BaseModel):
-    """Trivial result_type for review — signals the batch is complete.
-
-    Findings are collected via add_finding() tool calls during the loop.
-    """
-
-    summary: str = Field(description="Brief summary of review results")
-
-
-# ---------------------------------------------------------------------------
-# Batching — group files by total patch size
-# ---------------------------------------------------------------------------
-
-MAX_BATCH_ITEMS = 10
-MAX_BATCH_BYTES = 10_000
-
-
-def _make_batches(
-    items: list[DiffChunk],
-    *,
-    max_items: int = MAX_BATCH_ITEMS,
-    max_bytes: int = MAX_BATCH_BYTES,
-) -> list[list[DiffChunk]]:
-    """Group files into batches by size for review.
-
-    Small files get batched together. Large files get their own batch.
-    """
-    batches: list[list[DiffChunk]] = []
-    current: list[DiffChunk] = []
-    current_size = 0
-
-    for c in items:
-        patch_size = len(c.patch)
-
-        if patch_size > max_bytes:
-            if current:
-                batches.append(current)
-                current, current_size = [], 0
-            batches.append([c])
-            continue
-
-        if current_size + patch_size > max_bytes or len(current) >= max_items:
-            batches.append(current)
-            current, current_size = [], 0
-
-        current.append(c)
-        current_size += patch_size
-
-    if current:
-        batches.append(current)
-    return batches
-
-
-async def _review_files(
-    rctx: _ReviewCtx,
-    *,
-    chunks: list[DiffChunk],
-) -> list[PotentialFinding]:
-    """Review files in batches. Returns flat list of findings."""
-    if not chunks:
-        return []
-
-    batches = _make_batches(chunks)
-    logger.info("thorough: %d files -> %d review batches", len(chunks), len(batches))
-
-    sem = asyncio.Semaphore(rctx.concurrency)
-
-    async def review(batch: list[DiffChunk]) -> list[PotentialFinding]:
-        async with sem:
-            return await _review_batch(rctx, batch=batch)
-
-    results = await asyncio.gather(*(review(b) for b in batches))
-    return [f for batch_results in results for f in batch_results]
-
-
-async def _review_batch(
-    rctx: _ReviewCtx,
-    *,
-    batch: list[DiffChunk],
-) -> list[PotentialFinding]:
-    """Review a batch of files. Findings collected via add_finding() tool calls."""
-    pr = rctx.timeline.pr
-
-    # Build per-file diff sections with existing threads
-    file_sections = []
-    for chunk in batch:
-        existing = rctx.existing_threads.get(chunk.filename, [])
-        threads_text = "(none)"
-        if existing:
-            threads_text = "\n".join(
-                f"  - @{t.author.login} on L{t.line}: {t.body[:120]}" for t in existing
+        # --- Agentic sampling with tool-based result collection ---
+        try:
+            await ctx.sample(
+                messages=[self.VERIFY_INSTRUCTIONS, data],
+                system_prompt=self.SYSTEM_PROMPT,
+                result_type=VerifyComplete,
+                tools=[confirm_finding, dismiss_finding, *exploration_tools],
+                temperature=0.2,
+                max_tokens=8192,
             )
-        file_sections.append(
-            f"<file_diff>\n"
-            f"File: {chunk.filename} ({chunk.status}, "
-            f"+{chunk.additions} -{chunk.deletions})\n"
-            f"```diff\n{chunk.patch}\n```\n"
-            f"Existing threads: {threads_text}\n"
-            f"</file_diff>"
+        except Exception as exc:
+            logger.warning("thorough: verify failed: %s", exc)
+
+        return confirmed
+
+    def aggregate(
+        self,
+        confirmed_comments: list[ReviewComment],
+        total_files: int,
+        files_reviewed: int,
+        files_skipped: int,
+    ) -> PRReviewResult:
+        """Build the final result from verified findings only."""
+        comments = [c for c in confirmed_comments if c.confidence >= self.min_confidence]
+
+        sev = Counter(c.severity.value for c in comments)
+        cat = Counter(c.category.value for c in comments)
+        n_crit, n_high = sev.get("critical", 0), sev.get("high", 0)
+        risk, health = compute_scores(dict(sev))
+
+        return PRReviewResult(
+            verdict=compute_verdict(n_crit, n_high, sev.get("medium", 0)),
+            summary=(
+                f"Reviewed {files_reviewed} of {total_files} files "
+                f"({len(comments)} confirmed, "
+                f"{n_crit} critical, {n_high} high)."
+            ),
+            comments=comments,
+            risk_score=risk,
+            health_score=health,
+            files_reviewed=files_reviewed,
+            files_skipped=files_skipped,
+            stats=ReviewStats(
+                total_comments=len(comments),
+                by_severity=dict(sev),
+                by_category=dict(cat),
+            ),
         )
 
-    # Format prior review bodies (shared across batch)
-    prior_section = "(none)"
-    if rctx.prior_reviews:
-        prior_section = "\n---\n".join(body[:300] for body in rctx.prior_reviews[:3])
+    # -- Main entry point ---------------------------------------------------
 
-    # Format project context and linked issues
-    project_section = ""
-    if rctx.project_context:
-        project_section = f"\n<project_context>\n{rctx.project_context}\n</project_context>\n"
+    async def run(
+        self,
+        ctx: Context,
+        inp: ReviewInput,
+        file_reader: FileReader,
+    ) -> PRReviewResult:
+        """Full pipeline: prefilter → filter → review → verify → aggregate."""
+        with logfire.span(
+            "thorough_review",
+            intensity=self.intensity,
+        ):
+            return await self._run_inner(ctx, inp, file_reader)
 
-    issues_section = ""
-    if rctx.linked_issues:
-        issues_text = "\n\n".join(rctx.linked_issues)
-        issues_section = (
-            f"\n<linked_issues>\n"
-            f"Review against these requirements:\n"
-            f"{issues_text}\n"
-            f"</linked_issues>\n"
+    async def _run_inner(
+        self,
+        ctx: Context,
+        inp: ReviewInput,
+        file_reader: FileReader,
+    ) -> PRReviewResult:
+        total_files = len(inp.files)
+
+        # Pass 1: Prefilter (sync — skip binary/generated files)
+        chunks = self.prefilter(inp.files)
+        files_prefiltered = total_files - len(chunks)
+
+        # Pass 2: Filter (LLM classifies files as skip/review)
+        with logfire.span("pass 2: filter", files=len(chunks)):
+            reviewables = await self.filter_files(ctx, chunks, inp)
+            files_filtered = len(chunks) - len(reviewables)
+
+        # Pass 3: Review (batched review with tool-based finding collection)
+        with logfire.span("pass 3: review", files=len(reviewables)):
+            all_findings = await self.review_files(ctx, reviewables, inp, file_reader)
+
+        # Pass 4: Verify (agentic exploration to confirm/disprove)
+        with logfire.span("pass 4: verify", findings=len(all_findings)):
+            confirmed = await self.verify_findings(ctx, all_findings, inp, file_reader)
+
+        return self.aggregate(
+            confirmed, total_files, len(reviewables),
+            files_prefiltered + files_filtered,
         )
 
-    data = f"Intensity: {rctx.intensity}\n"
-    data += f"PR #{pr.number}: {pr.title} | @{pr.author.login} | {pr.head_ref} -> {pr.base_ref}\n"
-    if pr.body:
-        data += f"Description: {pr.body}\n"
-    if rctx.focus_areas:
-        data += f"Focus: {rctx.focus_areas}\n"
-    data += f"{project_section}{issues_section}\n"
-    data += "\n\n".join(file_sections)
-    if prior_section != "(none)":
-        data += f"\n\nPrior reviews (do NOT repeat):\n{prior_section}"
-
-    # --- State that accumulates via tool calls ---
-    findings: list[PotentialFinding] = []
-
-    def add_finding(
-        filename: str,
-        title: str,
-        body: str,
-        why: str,
-        verification_needs: str,
-        severity: str = "medium",
-        category: str = "bug",
-        line: int | None = None,
-        end_line: int | None = None,
-        suggested_code: str | None = None,
-        confidence: int = 70,
-    ) -> str:
-        """Report a code review finding.
-
-        Call this for each issue you find. Provide all required fields.
-        Only call this for issues you've verified through the protocol.
-        """
-        findings.append(
-            PotentialFinding(
-                path=filename,
-                line=line,
-                end_line=end_line,
-                severity=Severity(severity),
-                category=CommentCategory(category),
-                title=title,
-                body=body,
-                why=why,
-                suggested_code=suggested_code,
-                confidence=confidence,
-                verification_needs=verification_needs,
-            )
-        )
-        return f"Finding recorded: '{title}'. Continue reviewing or complete."
-
-    exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
-
-    try:
-        await rctx.ctx.sample(
-            messages=[REVIEW_INSTRUCTIONS, data],
-            system_prompt=SYSTEM_PROMPT,
-            result_type=ReviewDone,
-            tools=[add_finding, *exploration_tools],
-            temperature=0.2,
-            max_tokens=8192,
-        )
-    except (ValueError, RuntimeError) as exc:
-        logger.warning("thorough: review batch failed: %s", exc)
-
-    for f in findings:
-        logger.info("thorough: finding [%s] %s:%s — %s", f.severity, f.path, f.line, f.title)
-    return findings
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Pass 4: Verify (single agentic call)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-async def _verify_findings(
-    rctx: _ReviewCtx,
-    *,
-    findings: list[PotentialFinding],
-) -> list[ReviewComment]:
-    """Verify all findings in one agentic ctx.sample() call.
-
-    The LLM gets a compact list (file:line + reason) and exploration
-    tools. It calls confirm_finding() or dismiss_finding() for each.
-    One call, minimal prompt, tools do the heavy lifting.
-    """
-    if not findings:
-        return []
-
-    pr = rctx.timeline.pr
-
-    # --- State that accumulates across the tool loop ---
-    confirmed: list[ReviewComment] = []
-
-    # --- Finding management tools ---
-
-    def confirm_finding(
-        title: str,
-        evidence: str,
-        path: str,
-        line: int | None = None,
-        severity: str = "medium",
-        category: str = "bug",
-        body: str = "",
-        why: str = "",
-        suggested_code: str | None = None,
-        confidence: int = 80,
-    ) -> str:
-        """Confirm a finding is real and add it to the review.
-
-        Call this when your investigation confirms the issue exists.
-        Provide the evidence you found and an updated confidence score.
-        """
-        logger.info("thorough: CONFIRMED [%s] %s:%s — %s", severity, path, line, title)
-        confirmed.append(
-            ReviewComment(
-                path=path,
-                line=line,
-                severity=Severity(severity),
-                category=CommentCategory(category),
-                title=title,
-                body=body or f"Confirmed: {title}",
-                why=why or evidence,
-                suggested_code=suggested_code,
-                confidence=confidence,
-            )
-        )
-        already = [c.title for c in confirmed]
-        return (
-            f"Confirmed '{title}' (confidence={confidence}). "
-            f"Already confirmed: {already}. "
-            f"Move on to the next unprocessed finding."
-        )
-
-    def dismiss_finding(title: str, reason: str) -> str:
-        """Dismiss a finding — it's not a real issue.
-
-        Call this when your investigation shows the issue doesn't exist,
-        is handled elsewhere, or is inconclusive.
-        """
-        logger.info("thorough: DISMISSED %s — %s", title, reason[:80])
-        return f"Dismissed '{title}'. Reason: {reason}. Move on to the next unprocessed finding."
-
-    # --- Build compact finding list ---
-    finding_lines = []
-    for i, f in enumerate(findings):
-        finding_lines.append(
-            f'<finding index="{i}">\n'
-            f"{f.path}:{f.line or '?'} -- {f.title}\n"
-            f"{f.body}\n"
-            f"Verify: {f.verification_needs}\n"
-            f"</finding>"
-        )
-
-    n = len(findings)
-    data = (
-        f"PR #{pr.number}: {pr.title} | @{pr.author.login}\n"
-        f"Verify {n} findings:\n\n" + "\n\n".join(finding_lines)
-    )
-
-    exploration_tools = _make_exploration_tools(rctx.gh, rctx.timeline, rctx.repo)
-
-    # --- Agentic sampling with tool-based result collection ---
-    try:
-        await rctx.ctx.sample(
-            messages=[VERIFY_INSTRUCTIONS, data],
-            system_prompt=SYSTEM_PROMPT,
-            result_type=VerifyComplete,
-            tools=[confirm_finding, dismiss_finding, *exploration_tools],
-            temperature=0.2,
-            max_tokens=8192,
-        )
-    except (ValueError, RuntimeError) as exc:
-        logger.warning("thorough: verify failed: %s", exc)
-
-    return confirmed
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Aggregation — only confirmed findings survive
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _aggregate(
-    confirmed_comments: list[ReviewComment],
-    total_files: int,
-    files_reviewed: int,
-    files_skipped: int,
-    min_confidence: int,
-) -> PRReviewResult:
-    """Build the final result from verified findings only."""
-    comments = [c for c in confirmed_comments if c.confidence >= min_confidence]
-
-    sev = Counter(c.severity.value for c in comments)
-    cat = Counter(c.category.value for c in comments)
-    n_crit, n_high = sev.get("critical", 0), sev.get("high", 0)
-    risk, health = compute_scores(dict(sev))
-
-    return PRReviewResult(
-        verdict=compute_verdict(n_crit, n_high, sev.get("medium", 0)),
-        summary=(
-            f"Reviewed {files_reviewed} of {total_files} files "
-            f"({len(comments)} confirmed, "
-            f"{n_crit} critical, {n_high} high)."
-        ),
-        comments=comments,
-        risk_score=risk,
-        health_score=health,
-        files_reviewed=files_reviewed,
-        files_skipped=files_skipped,
-        stats=ReviewStats(
-            total_comments=len(comments),
-            by_severity=dict(sev),
-            by_category=dict(cat),
-        ),
-    )

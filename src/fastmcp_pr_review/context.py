@@ -1,4 +1,4 @@
-"""Project context gathering — shared by all pipeline versions.
+"""Project context gathering — shared by all review pipelines.
 
 Reads well-known project docs (README, AGENTS.md, etc.) and extracts
 linked issue references from PR body/branch name. These provide the
@@ -39,7 +39,7 @@ _ISSUE_REF_PATTERN = re.compile(
 async def gather_project_context(
     gh: GitHubPRClient,
     repo: str,
-    ref: str,
+    ref: str | None = None,
 ) -> str:
     """Read well-known project docs to understand the codebase.
 
@@ -55,11 +55,9 @@ async def gather_project_context(
     total = 0
 
     for path, result in zip(PROJECT_DOC_PATHS, results, strict=True):
-        if isinstance(result, Exception):
+        if isinstance(result, Exception) or result is None:
             continue
         content = str(result)
-        if not content or content.startswith("(unable to read"):
-            continue
 
         if len(content) > _MAX_DOC_CHARS:
             content = content[:_MAX_DOC_CHARS] + "\n... (truncated)"
@@ -102,11 +100,11 @@ async def extract_linked_issues(
 
     async def fetch_issue(num: int) -> str | None:
         try:
-            owner, repo_name = repo.split("/")
-            resp = await gh._github.rest.issues.async_get(owner, repo_name, num)
-            issue = resp.parsed_data
-            body = (issue.body or "")[:500]
-            return f"**#{num}: {issue.title}** ({issue.state})\n{body}"
+            result = await gh.get_issue(repo, num)
+            if result is None:
+                return None
+            title, state, body = result
+            return f"**#{num}: {title}** ({state})\n{body}"
         except Exception:
             return None
 
