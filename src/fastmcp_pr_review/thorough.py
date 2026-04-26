@@ -276,10 +276,33 @@ Verification protocol — complete ALL steps before calling add_finding:
 1. What specific code pattern or change triggers this concern?
 2. Is it handled elsewhere? Read the caller, check for middleware, look at types.
 3. Construct a concrete failure scenario with specific input/state. If you cannot: STOP.
+   EXCEPTION: For patterns involving context propagation, async state, or feature modes
+   (e.g., "suppress_X", "propagation_only", "no-op returns"), if you cannot construct
+   a failure scenario from the calling site alone, read the suppressed/dispatched path
+   and ask: "Does the advertised guarantee hold in the skipped code path?"
 4. Would a senior engineer on this team agree this is worth flagging? If unsure: STOP.
 
-No findings is valid and expected for most batches. Do not re-flag issues from \
-existing review threads. Do not repeat points from prior reviews.
+== Prior review awareness ==
+Do not repeat specific style nitpicks from existing threads.
+However: if a prior review identifies an architectural concern (e.g., "X may break Y
+in mode Z") and only describes the symptom, independently verify the claim using
+the verification protocol above. Confirm it properly or find that it was misdiagnosed.
+
+== Feature-mode / suppression patterns ==
+When code has a mode like "X_only" or "suppress_X" that claims to preserve behavior Y:
+  - The early-return in the suppressed path is NOT the complete picture
+  - Ask: what happens to Y in the suppressed path? Does Y actually still happen?
+  - A contradiction between the mode name/promise and the suppressed path IS a bug
+  Example: "propagation_only" mode that skips context propagation in the suppressed path
+           contradicts its advertised purpose
+  Example: "suppress_spans()" that never attaches propagated context breaks distributed tracing
+
+== Token / auth refresh ==
+FLAG: Changes to how expiry values (None, 0, negative) are interpreted —
+even if the new behavior is more correct, it may be a breaking change for
+callers who relied on the old interpretation.
+
+No findings is valid and expected for most batches.
 
 Intensity levels (the message will specify which):
   conservative: only flag confidence >= 80, zero comments is the expected outcome
