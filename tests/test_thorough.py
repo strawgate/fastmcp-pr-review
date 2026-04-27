@@ -574,12 +574,26 @@ class TestBuildVerifyMessage:
             commits=[],
         )
         f1 = PotentialFinding(
-            path="a.py", line=1, severity=Severity.HIGH, category=CommentCategory.BUG,
-            title="Bug1", body="", why="", confidence=80, verification_needs="v1",
+            path="a.py",
+            line=1,
+            severity=Severity.HIGH,
+            category=CommentCategory.BUG,
+            title="Bug1",
+            body="",
+            why="",
+            confidence=80,
+            verification_needs="v1",
         )
         f2 = PotentialFinding(
-            path="b.py", line=2, severity=Severity.MEDIUM, category=CommentCategory.BUG,
-            title="Bug2", body="", why="", confidence=75, verification_needs="v2",
+            path="b.py",
+            line=2,
+            severity=Severity.MEDIUM,
+            category=CommentCategory.BUG,
+            title="Bug2",
+            body="",
+            why="",
+            confidence=75,
+            verification_needs="v2",
         )
         msg = ThoroughReview._build_verify_message(inp, [f1, f2])
         assert 'index="0"' in msg

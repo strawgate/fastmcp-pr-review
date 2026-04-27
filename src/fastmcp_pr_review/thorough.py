@@ -658,9 +658,7 @@ Rules:
         file_reader: FileReader,
     ) -> list[PotentialFinding]:
         """Review a batch of files. Findings collected via add_finding() tool calls."""
-        file_sections = [
-            self._format_file_section(chunk, inp.existing_threads) for chunk in batch
-        ]
+        file_sections = [self._format_file_section(chunk, inp.existing_threads) for chunk in batch]
         data = self._build_review_message(batch, inp, file_sections, self.intensity)
 
         # --- State that accumulates via tool calls ---
@@ -749,6 +747,7 @@ Rules:
             evidence: str,
             path: str,
             line: int | None = None,
+            end_line: int | None = None,
             severity: str = "medium",
             category: str = "bug",
             body: str = "",
@@ -766,6 +765,7 @@ Rules:
                 ReviewComment(
                     path=path,
                     line=line,
+                    end_line=end_line,
                     severity=Severity(severity),
                     category=CommentCategory(category),
                     title=title,
@@ -808,7 +808,12 @@ Rules:
                 max_tokens=8192,
             )
         except Exception as exc:
-            logger.warning("thorough: verify failed: %s", exc)
+            logger.warning(
+                "thorough: verify failed: %s — returning %d/%d findings",
+                exc,
+                len(confirmed),
+                len(findings),
+            )
 
         return confirmed
 

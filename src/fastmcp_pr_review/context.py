@@ -98,15 +98,18 @@ async def extract_linked_issues(
     if not refs:
         return []
 
+    sem = asyncio.Semaphore(5)
+
     async def fetch_issue(num: int) -> str | None:
-        try:
-            result = await gh.get_issue(repo, num)
-            if result is None:
+        async with sem:
+            try:
+                result = await gh.get_issue(repo, num)
+                if result is None:
+                    return None
+                title, state, body = result
+                return f"**#{num}: {title}** ({state})\n{body}"
+            except Exception:
                 return None
-            title, state, body = result
-            return f"**#{num}: {title}** ({state})\n{body}"
-        except Exception:
-            return None
 
     results = await asyncio.gather(*(fetch_issue(n) for n in sorted(refs)))
     issues = [r for r in results if r is not None]

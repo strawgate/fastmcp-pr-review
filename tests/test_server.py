@@ -428,9 +428,10 @@ class TestFetchPrContext:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=pr_timeline)
 
-        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
-            "fastmcp_pr_review.server.extract_linked_issues"
-        ) as mock_eli:
+        with (
+            patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc,
+            patch("fastmcp_pr_review.server.extract_linked_issues") as mock_eli,
+        ):
             mock_gpc.return_value = "Project context text."
             mock_eli.return_value = ["Fixes #123"]
 
@@ -446,9 +447,10 @@ class TestFetchPrContext:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=pr_timeline)
 
-        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
-            "fastmcp_pr_review.server.extract_linked_issues"
-        ) as mock_eli:
+        with (
+            patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc,
+            patch("fastmcp_pr_review.server.extract_linked_issues") as mock_eli,
+        ):
             mock_gpc.return_value = ""
             mock_eli.return_value = []
 
@@ -470,9 +472,10 @@ class TestBuildReviewInput:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=pr_timeline)
 
-        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
-            "fastmcp_pr_review.server.extract_linked_issues"
-        ) as mock_eli:
+        with (
+            patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc,
+            patch("fastmcp_pr_review.server.extract_linked_issues") as mock_eli,
+        ):
             mock_gpc.return_value = "Project context."
             mock_eli.return_value = []
 
@@ -492,12 +495,11 @@ class TestBuildReviewInput:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=pr_timeline)
 
-        with patch("fastmcp_pr_review.server.gather_project_context"), patch(
-            "fastmcp_pr_review.server.extract_linked_issues"
+        with (
+            patch("fastmcp_pr_review.server.gather_project_context"),
+            patch("fastmcp_pr_review.server.extract_linked_issues"),
         ):
-            inp = await _build_review_input(
-                gh, "owner/repo", 42, focus_areas="security"
-            )
+            inp = await _build_review_input(gh, "owner/repo", 42, focus_areas="security")
 
         assert inp.focus_areas == "security"
 
@@ -513,15 +515,14 @@ class TestBuildThoroughReviewInput:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=pr_timeline)
 
-        with patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc, patch(
-            "fastmcp_pr_review.server.extract_linked_issues"
-        ) as mock_eli:
+        with (
+            patch("fastmcp_pr_review.server.gather_project_context") as mock_gpc,
+            patch("fastmcp_pr_review.server.extract_linked_issues") as mock_eli,
+        ):
             mock_gpc.return_value = ""
             mock_eli.return_value = []
 
-            inp, head_sha = await _build_thorough_review_input(
-                gh, "owner/repo", 42
-            )
+            inp, head_sha = await _build_thorough_review_input(gh, "owner/repo", 42)
 
         assert inp.commits == pr_timeline.commits
         assert "src/widget.py" in inp.existing_threads
@@ -566,8 +567,9 @@ class TestBuildThoroughReviewInput:
         gh = MagicMock()
         gh.get_timeline = AsyncMock(return_value=timeline)
 
-        with patch("fastmcp_pr_review.server.gather_project_context"), patch(
-            "fastmcp_pr_review.server.extract_linked_issues"
+        with (
+            patch("fastmcp_pr_review.server.gather_project_context"),
+            patch("fastmcp_pr_review.server.extract_linked_issues"),
         ):
             inp, _ = await _build_thorough_review_input(gh, "owner/repo", 1)
 
@@ -586,9 +588,7 @@ class TestMakePrFileReader:
         result = await reader("src/main.py")
 
         assert result == "file contents"
-        gh.get_file_contents.assert_awaited_once_with(
-            "owner/repo", "src/main.py", "abc123"
-        )
+        gh.get_file_contents.assert_awaited_once_with("owner/repo", "src/main.py", "abc123")
 
     @pytest.mark.asyncio
     async def test_returns_empty_string_on_none(self) -> None:
