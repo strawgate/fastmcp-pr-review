@@ -20,9 +20,10 @@ wheels/
 .vscode/
 *.swp
 
-# Claude Code
+# Claude Code / Codex
 .claude/
 .claude.json
+.codex/
 
 # Logfire
 .logfire/
