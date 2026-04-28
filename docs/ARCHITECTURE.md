@@ -133,7 +133,7 @@ src/fastmcp_pr_review/
 ├── server.py          # FastMCP tool registration + ReviewInput construction + CLI
 ├── fast.py            # FastReview: single-shot, structured output
 ├── thorough.py        # ThoroughReview: multi-pass pipeline + stage models
-└── context.py         # Project context (README, AGENTS.md) + linked issue extraction
+└── context.py         # Project context (README, AGENTS.md, linked issues) + linked issue extraction
 
 tests/
 ├── conftest.py        # Fixtures for all model types

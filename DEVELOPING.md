@@ -20,36 +20,7 @@ tests/
     test_thorough.py     ThoroughReview pipeline stages
 ```
 
-### Architecture: Pipeline Classes
-
-The review system separates two orthogonal axes:
-
-- **Data source** — where the diff/files/context come from → `ReviewInput` + `FileReader` (in `models.py`)
-- **Review strategy** — how the review is performed → pipeline class with step methods
-
-`ReviewInput` is a frozen dataclass bundling everything the review logic needs (files, title, description, project context, etc.). `FileReader` is a Protocol for reading full file contents — different implementations for PRs (GitHub API), local repos (filesystem), or raw diffs (no-op).
-
-**FastReview** (`fast.py`): Single `ctx.sample()` call with structured output. Override `SYSTEM_PROMPT` or `build_prompt()` for variants.
-
-**ThoroughReview** (`thorough.py`): Multi-pass pipeline with overridable step methods:
-1. `prefilter()` — skip binary/generated files
-2. `filter_files()` — LLM classifies files as skip/review
-3. `review_files()` — batched review with tool calls
-4. `verify_findings()` — agentic verification with file exploration
-5. `aggregate()` — score and produce final result
-
-Each mode file is self-contained: prompts inline, stage models inline. They share only `models.py` types.
-
-### Extension Example
-
-```python
-class SecurityReview(ThoroughReview):
-    SYSTEM_PROMPT = "You are a security auditor..."
-    intensity = "aggressive"
-
-    async def filter_files(self, ctx, chunks, inp):
-        return chunks  # review everything
-```
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architecture, data flow, and design decisions.
 
 ## Commands
 
@@ -62,13 +33,8 @@ make typecheck                    # Type check
 make test                         # Run tests
 make server-stdio                 # Run stdio server
 make server-http                  # Run HTTP server at http://127.0.0.1:8000/mcp/
-uv run pytest tests/ -v           # Run tests
-uv run ruff check src/ tests/     # Lint
-uv run ruff format src/ tests/    # Format
-uv run ty check                   # Type check
 uv build                          # Build sdist + wheel with uv
 uv run fastmcp-pr-review          # Run the server
-uv run python scripts/run_review.py owner/repo 123 fast  # Dev smoke test
 ```
 
 ## How Sampling Works
@@ -146,3 +112,4 @@ mcp = FastMCP(
 - **githubkit** — Async GitHub API client
 - **google-genai** — Google Gemini SDK (for sampling fallback handler)
 - **pydantic** — Data validation and JSON schema generation
+- **logfire** — OpenTelemetry instrumentation
